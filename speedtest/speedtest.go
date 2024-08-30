@@ -14,7 +14,7 @@ import (
 
 var (
 	version          = "1.7.8"
-	DefaultUserAgent = fmt.Sprintf("showwin/speedtest-go %s", version)
+	DefaultUserAgent = fmt.Sprintf("agi7/speedtest-go %s", version)
 )
 
 type Proto int
