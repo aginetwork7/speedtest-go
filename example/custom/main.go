@@ -20,7 +20,7 @@ func main() {
 		),
 	)
 
-	s, err := speedtestClient.CustomServer("http://4gsuzhou1.speedtest.jsinfo.net:8080")
+	s, err := speedtestClient.CustomServer("http://dev-api.agi7.ai:10000")
 	checkError(err)
 	// Please make sure your host can access this test server,
 	// otherwise you will get an error.
@@ -45,6 +45,7 @@ func main() {
 	start = time.Now()
 	var uploadCallbackSeq int32
 	s.Context.SetCallbackUpload(func(upRate speedtest.ByteRate) {
+		fmt.Println("Upload: ", upRate)
 		if uploadCallbackSeq%20 == 0 {
 			fmt.Println("Upload: ", int64(upRate.Mbps()*1000), "kbps")
 		}
