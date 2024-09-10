@@ -14,7 +14,7 @@ import (
 
 var (
 	version          = "1.7.8"
-	DefaultUserAgent = fmt.Sprintf("showwin/speedtest-go %s", version)
+	DefaultUserAgent = fmt.Sprintf("agi7/speedtest-go %s", version)
 )
 
 type Proto int
@@ -53,7 +53,8 @@ type UserConfig struct {
 	LocationFlag string
 	Location     *Location
 
-	Keyword string // Fuzzy search
+	Keyword    string // Fuzzy search
+	Credential string // Auth
 }
 
 func parseAddr(addr string) (string, string) {
