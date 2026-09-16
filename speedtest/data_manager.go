@@ -263,6 +263,12 @@ func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, m
 		}
 	}
 	wg.Wait()
+
+	// Close the direction whatever stopped the workers. They also exit when the
+	// context ends, and on that path nothing else would stop the rate capture
+	// goroutine — leaving it writing the Welford state while the caller reads
+	// the final rate out of it.
+	td.closeFunc()
 }
 
 func (td *TestDirection) rateCapture() chan bool {

@@ -151,3 +151,22 @@ func TestNewLeavesDefaultClientAlone(t *testing.T) {
 		t.Fatal("New replaced http.DefaultClient.Transport")
 	}
 }
+
+// Workers exit when the context ends as well as when the capture window
+// closes. On the context path nothing else stops the rate-capture goroutine, so
+// it kept writing the Welford state while the caller read the final rate out of
+// it. Run with -race.
+func TestCancelledPhaseStopsTheRateCapture(t *testing.T) {
+	server, _ := newCountingServer(t, func() { time.Sleep(5 * time.Millisecond) })
+	target := newTestTarget(t, server.URL, 30*time.Second, 4)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 150*time.Millisecond)
+	defer cancel()
+
+	_ = target.DownloadTestContext(ctx)
+
+	// Reading the rate after the phase returned must not race the capture
+	// goroutine, so the phase has to have closed it down.
+	_ = target.Context.GetEWMADownloadRate()
+	_ = target.DLSpeed.Mbps()
+}
