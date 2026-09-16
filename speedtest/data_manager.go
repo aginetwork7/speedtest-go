@@ -180,7 +180,13 @@ func (td *TestDirection) AddTotalDataVolume(delta int64) int64 {
 	return atomic.AddInt64(&td.totalDataVolume, delta)
 }
 
-func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerIndex int) {
+// Start runs the registered handlers until the capture window closes or ctx
+// ends, then blocks until every worker has stopped.
+//
+// ctx must be the same context the handlers issue their requests with: when it
+// ends, the handlers fail immediately, so a worker that kept looping on the
+// running flag alone would spin at full CPU until the capture timer fired.
+func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, mainRequestHandlerIndex int) {
 	if len(td.fns) == 0 {
 		panic("empty task stack")
 	}
@@ -219,21 +225,29 @@ func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerInde
 		})
 	}
 
+	// worker repeatedly invokes one handler until the direction is closed.
+	// Keeping this in one place stops the two spawn loops below from drifting
+	// apart, which would leave one of them ignoring cancellation.
+	worker := func(fnIndex int) {
+		defer wg.Done()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			td.manager.runningRW.RLock()
+			running := td.manager.running
+			td.manager.runningRW.RUnlock()
+			if !running {
+				return
+			}
+			td.fns[fnIndex]()
+		}
+	}
+
 	time.AfterFunc(td.manager.captureTime, td.closeFunc)
 	for i := 0; i < mainN; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				td.manager.runningRW.RLock()
-				running := td.manager.running
-				td.manager.runningRW.RUnlock()
-				if !running {
-					return
-				}
-				td.fns[mainRequestHandlerIndex]()
-			}
-		}()
+		go worker(mainRequestHandlerIndex)
 	}
 	for j := 0; j < auxN; {
 		for i := range td.fns {
@@ -244,19 +258,7 @@ func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerInde
 				continue
 			}
 			wg.Add(1)
-			t := i
-			go func() {
-				defer wg.Done()
-				for {
-					td.manager.runningRW.RLock()
-					running := td.manager.running
-					td.manager.runningRW.RUnlock()
-					if !running {
-						return
-					}
-					td.fns[t]()
-				}
-			}()
+			go worker(i)
 			j++
 		}
 	}
@@ -472,9 +474,15 @@ func (dc *DataChunk) WriteTo(w io.Writer) (written int64, err error) {
 		dc.manager.runningRW.RLock()
 		running := dc.manager.running
 		dc.manager.runningRW.RUnlock()
+		// Finishing the payload, and being stopped part-way through it, are both
+		// successful outcomes for this writer: the body is chunked, so a short
+		// body is still a well-formed one. Reporting io.EOF here made net/http
+		// treat every upload as a broken request, which skipped the terminating
+		// chunk and cost the connection — so each request paid a fresh handshake
+		// and restarted congestion control.
 		if !running || dc.remainOrDiscardSize <= 0 {
 			dc.endTime = time.Now()
-			return written, io.EOF
+			return written, nil
 		}
 		if dc.remainOrDiscardSize < readChunkSize {
 			nr = int(dc.remainOrDiscardSize)

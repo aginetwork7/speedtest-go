@@ -57,7 +57,7 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 	if td == nil {
 		return ErrorUninitializedManager
 	}
-	td.Start(cancel, mainIDIndex) // block here
+	td.Start(_context, cancel, mainIDIndex) // block here
 	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
 		s.DLSpeed = -1 // N/A
@@ -92,7 +92,7 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	if td == nil {
 		return ErrorUninitializedManager
 	}
-	td.Start(cancel, mainIDIndex) // block here
+	td.Start(_context, cancel, mainIDIndex) // block here
 	s.ULSpeed = ByteRate(td.manager.GetEWMAUploadRate())
 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
 		s.ULSpeed = -1 // N/A
@@ -120,7 +120,7 @@ func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downlo
 		if err := downloadRequest(_context, s, 3); err != nil {
 			atomic.AddInt64(&errorTimes, 1)
 		}
-	}).Start(cancel, 0)
+	}).Start(_context, cancel, 0)
 	duration := time.Since(start)
 	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
@@ -128,7 +128,7 @@ func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downlo
 	}
 	s.TestDuration.Download = &duration
 	s.testDurationTotalCount()
-	return nil
+	return phaseError(ctx, atomic.LoadInt64(&requestTimes), atomic.LoadInt64(&errorTimes))
 }
 
 // UploadTest executes the test to measure upload speed
@@ -151,7 +151,7 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 		if err := uploadRequest(_context, s, 4); err != nil {
 			atomic.AddInt64(&errorTimes, 1)
 		}
-	}).Start(cancel, 0)
+	}).Start(_context, cancel, 0)
 	duration := time.Since(start)
 	s.ULSpeed = ByteRate(s.Context.GetEWMAUploadRate())
 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
@@ -159,6 +159,27 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	}
 	s.TestDuration.Upload = &duration
 	s.testDurationTotalCount()
+	return phaseError(ctx, atomic.LoadInt64(&requestTimes), atomic.LoadInt64(&errorTimes))
+}
+
+// phaseError reports whether a throughput phase produced anything usable.
+//
+// ctx is the caller's context rather than the derived one, which is always
+// cancelled on the way out as part of closing the phase.
+//
+// Without this verdict a phase reports success no matter what happened, so a
+// caller cannot distinguish an unreachable server from a genuinely idle link:
+// both arrive as a rate of zero and a nil error.
+func phaseError(ctx context.Context, requestTimes, errorTimes int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if requestTimes == 0 {
+		return ErrConnectTimeout
+	}
+	if errorTimes == requestTimes {
+		return ErrConnectTimeout
+	}
 	return nil
 }
 
