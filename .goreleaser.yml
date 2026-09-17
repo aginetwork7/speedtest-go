@@ -1,5 +1,7 @@
 # This is an example goreleaser.yaml file with some sane defaults.
 # Make sure to check the documentation at http://goreleaser.com
+version: 2
+
 before:
   hooks:
     # You may remove this if you don't use go modules.
@@ -36,6 +38,15 @@ builds:
     gomips:
       - hardfloat
       - softfloat
+    # golang.org/x/sys is pinned at the 2022 revision this fork inherited, and
+    # that revision carries no syscall tables for these two OpenBSD ports, so
+    # the build fails there while every other target in the matrix succeeds.
+    # Drop these entries once the dependency is bumped.
+    ignore:
+      - goos: openbsd
+        goarch: riscv64
+      - goos: openbsd
+        goarch: ppc64
     ldflags:
       - -s -w -X main.version={{.Version}} -X main.commit={{.ShortCommit}} -X main.date={{ .CommitDate }}
 archives:
@@ -45,7 +56,7 @@ archives:
 checksum:
   name_template: 'checksums.txt'
 snapshot:
-  name_template: "{{ .Tag }}-next"
+  version_template: "{{ .Tag }}-next"
 changelog:
   sort: asc
   filters:
