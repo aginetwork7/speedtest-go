@@ -170,7 +170,7 @@ func (o *hangingOrigin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		panic(err)
 	}
 	defer conn.Close()
-	io.Copy(io.Discard, conn)
+	_, _ = io.Copy(io.Discard, conn)
 }
 
 // TestUploadRateIgnoresUnacknowledgedBytes is the regression test for the
