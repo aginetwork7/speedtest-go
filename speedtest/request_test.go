@@ -2,7 +2,6 @@ package speedtest
 
 import (
 	"context"
-	"fmt"
 	"runtime"
 	"testing"
 	"time"
@@ -55,7 +54,7 @@ func TestUploadTestContext(t *testing.T) {
 
 	err := server.uploadTestContext(
 		context.Background(),
-		mockRequest,
+		mockUploadRequest,
 	)
 	if err != nil {
 		t.Errorf(err.Error())
@@ -69,8 +68,14 @@ func TestUploadTestContext(t *testing.T) {
 	}
 }
 
-func mockRequest(ctx context.Context, s *Server, w int) error {
-	fmt.Sprintln(w)
+// mockUploadRequest adapts the shared mock to uploadFunc, which no longer
+// carries a size index now that request bodies are sized from the measured
+// rate rather than from a fixed table.
+func mockUploadRequest(ctx context.Context, s *Server) error {
+	return mockRequest(ctx, s, 0)
+}
+
+func mockRequest(ctx context.Context, s *Server, _ int) error {
 	dc := s.Context.Manager.NewChunk()
 	// (0.1MegaByte * 8bit * nConn * 10loop) / 0.1s = n*80Megabit
 	// sleep has bad deviation on windows

@@ -30,6 +30,25 @@ type Manager interface {
 	GetEWMADownloadRate() float64
 	GetEWMAUploadRate() float64
 
+	// Upload rate measured against server acknowledgements. See upload_ack.go
+	// for why the byte counters above cannot answer this for uploads.
+
+	// NextUploadPayload reports the body size in bytes for the next upload
+	// request. It shrinks to what the rest of the capture window can deliver,
+	// because a request the window cuts short is never acknowledged.
+	NextUploadPayload() int64
+	// AckUpload records that the server acknowledged a request. Both arguments
+	// must come from the WriteSpan() of the chunk that request carried; a zero
+	// start or a non-positive count is ignored, which is what a chunk that
+	// never wrote reports.
+	AckUpload(writeStart time.Time, written int64)
+	// SetUploadLatency supplies the round trip to exclude from transfer time.
+	// It survives the per-phase reset: the round trip belongs to the path.
+	SetUploadLatency(duration time.Duration)
+	// GetAckedUploadRate reports bytes per second across all workers of the
+	// current phase, not per worker.
+	GetAckedUploadRate() float64
+
 	SetCallbackDownload(callback func(downRate ByteRate))
 	SetCallbackUpload(callback func(upRate ByteRate))
 
@@ -51,6 +70,10 @@ type Chunk interface {
 	GetRate() float64
 	GetDuration() time.Duration
 	GetParent() Manager
+
+	// WriteSpan reports when this chunk put its first byte on the wire and how
+	// many bytes it wrote, which is what the server acknowledges by responding.
+	WriteSpan() (start time.Time, written int64)
 
 	Read(b []byte) (n int, err error)
 }
@@ -103,15 +126,20 @@ type TestDirection struct {
 	welford         *internal.Welford           // std/EWMA/mean
 	captureCallback func(realTimeRate ByteRate) // user callback
 	closeFunc       func()                      // close func
+	ackMeter        *uploadAckMeter             // upload only, see upload_ack.go
 	*funcGroup                                  // actually exec function
 }
 
 func (dm *DataManager) NewDataDirection(testType int) *TestDirection {
-	return &TestDirection{
+	td := &TestDirection{
 		TestType:  testType,
 		manager:   dm,
 		funcGroup: &funcGroup{},
 	}
+	if testType == typeUpload {
+		td.ackMeter = newUploadAckMeter()
+	}
+	return td
 }
 
 func NewDataManager() *DataManager {
@@ -180,9 +208,22 @@ func (td *TestDirection) AddTotalDataVolume(delta int64) int64 {
 	return atomic.AddInt64(&td.totalDataVolume, delta)
 }
 
-func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerIndex int) {
+// Start runs the registered handlers until the capture window closes or ctx
+// ends, then blocks until every worker has stopped.
+//
+// ctx must be the same context the handlers issue their requests with: when it
+// ends, the handlers fail immediately, so a worker that kept looping on the
+// running flag alone would spin at full CPU until the capture timer fired.
+func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, mainRequestHandlerIndex int) {
 	if len(td.fns) == 0 {
 		panic("empty task stack")
+	}
+	// A phase reports what it measured, so it starts from a clean meter. The
+	// download side already got this for free — rateCapture builds a fresh
+	// Welford per run — while the upload meter lived as long as the direction
+	// and would have folded an earlier phase's samples into this one's rate.
+	if td.ackMeter != nil {
+		td.ackMeter.reset()
 	}
 	if mainRequestHandlerIndex > len(td.fns)-1 {
 		mainRequestHandlerIndex = 0
@@ -219,21 +260,29 @@ func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerInde
 		})
 	}
 
+	// worker repeatedly invokes one handler until the direction is closed.
+	// Keeping this in one place stops the two spawn loops below from drifting
+	// apart, which would leave one of them ignoring cancellation.
+	worker := func(fnIndex int) {
+		defer wg.Done()
+		for {
+			if ctx.Err() != nil {
+				return
+			}
+			td.manager.runningRW.RLock()
+			running := td.manager.running
+			td.manager.runningRW.RUnlock()
+			if !running {
+				return
+			}
+			td.fns[fnIndex]()
+		}
+	}
+
 	time.AfterFunc(td.manager.captureTime, td.closeFunc)
 	for i := 0; i < mainN; i++ {
 		wg.Add(1)
-		go func() {
-			defer wg.Done()
-			for {
-				td.manager.runningRW.RLock()
-				running := td.manager.running
-				td.manager.runningRW.RUnlock()
-				if !running {
-					return
-				}
-				td.fns[mainRequestHandlerIndex]()
-			}
-		}()
+		go worker(mainRequestHandlerIndex)
 	}
 	for j := 0; j < auxN; {
 		for i := range td.fns {
@@ -244,23 +293,24 @@ func (td *TestDirection) Start(cancel context.CancelFunc, mainRequestHandlerInde
 				continue
 			}
 			wg.Add(1)
-			t := i
-			go func() {
-				defer wg.Done()
-				for {
-					td.manager.runningRW.RLock()
-					running := td.manager.running
-					td.manager.runningRW.RUnlock()
-					if !running {
-						return
-					}
-					td.fns[t]()
-				}
-			}()
+			go worker(i)
 			j++
 		}
 	}
 	wg.Wait()
+
+	// Close the direction whatever stopped the workers. They also exit when the
+	// context ends, and on that path nothing else would stop the rate capture
+	// goroutine — leaving it writing the Welford state while the caller reads
+	// the final rate out of it.
+	td.closeFunc()
+
+	// Drop the handlers this run registered. Each closure holds the context
+	// this run has just cancelled, and RegisterUpload/DownloadHandler only
+	// accepts new ones while fewer than nThread are installed — so a caller
+	// starting another phase on this direction would otherwise inherit workers
+	// that can only fail, and with a single thread would get nothing else.
+	td.fns = nil
 }
 
 func (td *TestDirection) rateCapture() chan bool {
@@ -371,6 +421,31 @@ func (dm *DataManager) GetAvgUploadRate() float64 {
 	return float64(dm.upload.GetTotalDataVolume()*8/1000) / unit
 }
 
+func (dm *DataManager) NextUploadPayload() int64 {
+	return dm.upload.ackMeter.nextPayload()
+}
+
+func (dm *DataManager) AckUpload(writeStart time.Time, written int64) {
+	dm.upload.ackMeter.ack(writeStart, written)
+}
+
+// noteUploadWrite reports the first byte of the phase reaching the wire, which
+// is where the capture window is counted from. It is unexported because only
+// the chunk writer can know that moment.
+func (dm *DataManager) noteUploadWrite(at time.Time, window time.Duration) {
+	dm.upload.ackMeter.noteWrite(at, window)
+}
+
+// SetUploadLatency supplies the round trip the latency phase measured, so that
+// the wait for each acknowledgement is not charged to the link.
+func (dm *DataManager) SetUploadLatency(duration time.Duration) {
+	dm.upload.ackMeter.setLatency(duration)
+}
+
+func (dm *DataManager) GetAckedUploadRate() float64 {
+	return dm.upload.ackMeter.rate(dm.nThread)
+}
+
 func (dm *DataManager) GetEWMAUploadRate() float64 {
 	if dm.upload.welford != nil {
 		return dm.upload.welford.EWMA()
@@ -386,6 +461,7 @@ type DataChunk struct {
 	err                 error
 	ContentLength       int64
 	remainOrDiscardSize int64
+	writeStart          time.Time
 }
 
 var blackHolePool = sync.Pool{
@@ -464,6 +540,12 @@ func (dc *DataChunk) GetParent() Manager {
 	return dc.manager
 }
 
+// WriteSpan reports when this chunk began writing and how much it wrote. A
+// chunk that never got to write reports a zero time and zero bytes.
+func (dc *DataChunk) WriteSpan() (time.Time, int64) {
+	return dc.writeStart, dc.ContentLength - dc.remainOrDiscardSize
+}
+
 // WriteTo Used to hook all traffic.
 func (dc *DataChunk) WriteTo(w io.Writer) (written int64, err error) {
 	nw := 0
@@ -472,9 +554,21 @@ func (dc *DataChunk) WriteTo(w io.Writer) (written int64, err error) {
 		dc.manager.runningRW.RLock()
 		running := dc.manager.running
 		dc.manager.runningRW.RUnlock()
+		// Finishing the payload, and being stopped part-way through it, are both
+		// successful outcomes for this writer: the body is chunked, so a short
+		// body is still a well-formed one. Reporting io.EOF here made net/http
+		// treat every upload as a broken request, which skipped the terminating
+		// chunk and dropped the connection — so each request paid a fresh
+		// handshake and restarted congestion control.
 		if !running || dc.remainOrDiscardSize <= 0 {
 			dc.endTime = time.Now()
-			return written, io.EOF
+			return written, nil
+		}
+		if dc.writeStart.IsZero() {
+			// Rate is measured from the first byte on the wire, so that
+			// connection setup is not charged to the link.
+			dc.writeStart = time.Now()
+			dc.manager.noteUploadWrite(dc.writeStart, dc.manager.captureTime)
 		}
 		if dc.remainOrDiscardSize < readChunkSize {
 			nr = int(dc.remainOrDiscardSize)

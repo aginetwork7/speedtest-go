@@ -202,7 +202,11 @@ func WithUserConfig(userConfig *UserConfig) Option {
 // New creates a new speedtest client.
 func New(opts ...Option) *Speedtest {
 	s := &Speedtest{
-		doer:    http.DefaultClient,
+		// A private client, because NewUserConfig installs this instance as the
+		// transport of whatever doer is set. Defaulting to http.DefaultClient
+		// made merely constructing a client reroute every unrelated request in
+		// the process through a speedtest transport.
+		doer:    &http.Client{},
 		Manager: NewDataManager(),
 	}
 	// load default config

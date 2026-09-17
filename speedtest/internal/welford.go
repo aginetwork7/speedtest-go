@@ -106,6 +106,12 @@ func (w *Welford) StandardDeviation() float64 {
 	return w.currentStdDev
 }
 
+// Steps reports how many samples have been entered. It is what tells an
+// observer whether whatever feeds this instrument is still running.
+func (w *Welford) Steps() int {
+	return w.steps
+}
+
 func (w *Welford) EWMA() float64 {
 	return w.ewmaMean*0.5 + w.movingAvg/float64(w.n)*0.5
 }
