@@ -58,7 +58,7 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 	td.Start(_context, cancel, mainIDIndex) // block here
 	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && tally.mostlyFailed() {
-		s.DLSpeed = -1 // N/A
+		s.DLSpeed = RateUnavailable
 	}
 	return phaseError(ctx, tally, td.manager.GetTotalDownload()-before)
 }
@@ -93,7 +93,7 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	td.Start(_context, cancel, mainIDIndex) // block here
 	s.ULSpeed = ByteRate(td.manager.GetAckedUploadRate())
 	if s.ULSpeed == 0 && tally.mostlyFailed() {
-		s.ULSpeed = -1 // N/A
+		s.ULSpeed = RateUnavailable
 	}
 	return phaseError(ctx, tally, td.manager.GetTotalUpload()-before)
 }
@@ -123,7 +123,7 @@ func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downlo
 	duration := time.Since(start)
 	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && tally.mostlyFailed() {
-		s.DLSpeed = -1 // N/A
+		s.DLSpeed = RateUnavailable
 	}
 	s.TestDuration.Download = &duration
 	s.testDurationTotalCount()
@@ -154,7 +154,7 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	duration := time.Since(start)
 	s.ULSpeed = ByteRate(s.Context.GetAckedUploadRate())
 	if s.ULSpeed == 0 && tally.mostlyFailed() {
-		s.ULSpeed = -1 // N/A
+		s.ULSpeed = RateUnavailable
 	}
 	s.TestDuration.Upload = &duration
 	s.testDurationTotalCount()
@@ -204,6 +204,15 @@ func (t *phaseTally) mostlyFailed() bool {
 	return float64(failures)/float64(requests) > 0.1
 }
 
+// noneSucceeded reports the two ways a phase can end with nothing usable:
+// no request was ever dispatched, and every dispatched request failed. They
+// are one predicate because the verdict treats them alike, and separate
+// clauses because neither implies the other.
+func (t *phaseTally) noneSucceeded() bool {
+	requests, failures := t.counts()
+	return requests == 0 || failures == requests
+}
+
 // cause reports the last error a request produced, or nil if none did.
 func (t *phaseTally) cause() error {
 	if boxed, ok := t.lastErr.Load().(phaseCause); ok {
@@ -238,10 +247,7 @@ func phaseError(ctx context.Context, tally *phaseTally, transferred int64) error
 	if transferred > 0 {
 		return nil
 	}
-	requests, failures := tally.counts()
-	// Nothing usable happened: either no request was ever dispatched, or every
-	// dispatched one failed.
-	if requests == 0 || failures == requests {
+	if tally.noneSucceeded() {
 		if cause := tally.cause(); cause != nil {
 			// The sentinel stays matchable with errors.Is; the concrete
 			// transport error is what says whether to check the address, the

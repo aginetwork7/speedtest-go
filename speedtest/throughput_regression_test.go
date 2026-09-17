@@ -295,7 +295,13 @@ func TestNewLeavesDefaultClientAlone(t *testing.T) {
 // Workers exit when the context ends as well as when the capture window
 // closes. On the context path nothing else stops the rate-capture goroutine, so
 // it kept writing the Welford state while the caller read the final rate out of
-// it. Run with -race.
+// it.
+//
+// The assertion is the instrument's own sample count: it advances once per tick
+// for as long as the capture goroutine lives, so a count that stands still
+// across several tick periods is the goroutine being gone. Run under -race the
+// same test also catches the read itself racing the writer, but it no longer
+// depends on the detector to mean something.
 func TestCancelledPhaseStopsTheRateCapture(t *testing.T) {
 	server, _ := newCountingServer(t, func() { time.Sleep(5 * time.Millisecond) })
 	target := newTestTarget(t, server.URL, 30*time.Second, 4)
@@ -305,8 +311,15 @@ func TestCancelledPhaseStopsTheRateCapture(t *testing.T) {
 
 	_ = target.DownloadTestContext(ctx)
 
+	manager := target.Context.Manager.(*DataManager)
+	settled := manager.download.welford.Steps()
+	time.Sleep(10 * manager.rateCaptureFrequency)
+	if running := manager.download.welford.Steps(); running != settled {
+		t.Fatalf("the rate capture took %d more samples after the phase returned; it is still running", running-settled)
+	}
+
 	// Reading the rate after the phase returned must not race the capture
-	// goroutine, so the phase has to have closed it down.
+	// goroutine either.
 	_ = target.Context.GetEWMADownloadRate()
 	_ = target.DLSpeed.Mbps()
 }
