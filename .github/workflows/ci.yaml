@@ -35,7 +35,10 @@ jobs:
     steps:
       - uses: actions/checkout@v3
       - name: test
-        run: go test ./speedtest -v
+        # -race is what makes the cancellation regression test mean anything:
+        # it asserts that the rate-capture goroutine has stopped by the time
+        # the caller reads the rate, and only the detector can see that.
+        run: go test -race ./speedtest -v
 
   lint:
     needs: setup
