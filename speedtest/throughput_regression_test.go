@@ -170,3 +170,49 @@ func TestCancelledPhaseStopsTheRateCapture(t *testing.T) {
 	_ = target.Context.GetEWMADownloadRate()
 	_ = target.DLSpeed.Mbps()
 }
+
+// slowServer delivers a payload slowly enough that no request finishes inside
+// the capture window, which is what a shaped or low-bandwidth link looks like.
+func newSlowServer(t *testing.T, bytesPerTick int, tick time.Duration) *httptest.Server {
+	t.Helper()
+	chunk := make([]byte, bytesPerTick)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			_, _ = io.Copy(io.Discard, r.Body)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		flusher, _ := w.(http.Flusher)
+		for {
+			if _, err := w.Write(chunk); err != nil {
+				return
+			}
+			if flusher != nil {
+				flusher.Flush()
+			}
+			select {
+			case <-r.Context().Done():
+				return
+			case <-time.After(tick):
+			}
+		}
+	}))
+	t.Cleanup(server.Close)
+	return server
+}
+
+// Closing a phase cancels whatever is in flight. On a link too slow to finish
+// one chunk inside the capture window every request ends cancelled, and
+// counting those as failures reported a working link as unreachable — which
+// excluded exactly the low-bandwidth links this client exists to measure.
+func TestSlowLinkIsNotReportedAsUnreachable(t *testing.T) {
+	server := newSlowServer(t, 16<<10, 20*time.Millisecond)
+	target := newTestTarget(t, server.URL, 500*time.Millisecond, 1)
+
+	if err := target.DownloadTestContext(context.Background()); err != nil {
+		t.Fatalf("a link that delivered bytes must not be reported unreachable: %v", err)
+	}
+	if target.Context.GetTotalDownload() == 0 {
+		t.Fatal("the test did not actually transfer anything")
+	}
+}

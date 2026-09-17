@@ -128,7 +128,7 @@ func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downlo
 	}
 	s.TestDuration.Download = &duration
 	s.testDurationTotalCount()
-	return phaseError(ctx, atomic.LoadInt64(&requestTimes), atomic.LoadInt64(&errorTimes))
+	return phaseError(ctx, atomic.LoadInt64(&requestTimes), atomic.LoadInt64(&errorTimes), s.Context.GetTotalDownload())
 }
 
 // UploadTest executes the test to measure upload speed
@@ -159,7 +159,7 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	}
 	s.TestDuration.Upload = &duration
 	s.testDurationTotalCount()
-	return phaseError(ctx, atomic.LoadInt64(&requestTimes), atomic.LoadInt64(&errorTimes))
+	return phaseError(ctx, atomic.LoadInt64(&requestTimes), atomic.LoadInt64(&errorTimes), s.Context.GetTotalUpload())
 }
 
 // phaseError reports whether a throughput phase produced anything usable.
@@ -170,14 +170,23 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 // Without this verdict a phase reports success no matter what happened, so a
 // caller cannot distinguish an unreachable server from a genuinely idle link:
 // both arrive as a rate of zero and a nil error.
-func phaseError(ctx context.Context, requestTimes, errorTimes int64) error {
+//
+// transferred is what decides it, not the request tally. Closing a phase
+// cancels whatever is still in flight, so on a link too slow to finish one
+// chunk inside the capture window every single request ends cancelled — a
+// 976 KiB upload needs about 81 KB/s to complete within 12 seconds, and a
+// 1.89 MiB download about 162 KB/s. Counting those cancellations as failures
+// reported a working link as unreachable, which excluded exactly the
+// low-bandwidth links this client exists to measure. Bytes on the wire prove
+// the endpoint answered, whatever became of the requests carrying them.
+func phaseError(ctx context.Context, requestTimes, errorTimes, transferred int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if requestTimes == 0 {
-		return ErrConnectTimeout
+	if transferred > 0 {
+		return nil
 	}
-	if errorTimes == requestTimes {
+	if requestTimes == 0 || errorTimes == requestTimes {
 		return ErrConnectTimeout
 	}
 	return nil
