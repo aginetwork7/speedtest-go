@@ -77,6 +77,46 @@ func TestUploadRateMatchesWireRate(t *testing.T) {
 	}
 }
 
+// TestUploadExcludesRoundTrip pins the correction for the larger of the two
+// errors found on a real path: a worker sends nothing while it waits to be told
+// the body arrived, so charging that wait to the link understates it by an
+// amount that grows with distance — 19% at 335 ms. The same device would then
+// read differently against two endpoints purely because of where they are.
+func TestUploadExcludesRoundTrip(t *testing.T) {
+	m := newUploadAckMeter()
+	m.setLatency(300 * time.Millisecond)
+	m.noteWrite(time.Now(), 12*time.Second)
+
+	// 200 kB acknowledged 2.3 s after the first byte, 0.3 s of which was the
+	// round trip: the link carried 200 kB in 2 s.
+	m.ack(time.Now().Add(-2300*time.Millisecond), 200_000)
+
+	const want = 100_000.0 // bytes/sec
+	if got := m.rate(1); got < want*0.98 || got > want*1.02 {
+		t.Errorf("rate %.0f B/s, want %.0f — the round trip is being charged to the link", got, want)
+	}
+}
+
+// TestUploadIgnoresShortRequests pins the correction for the other error: on a
+// reused connection the next request's bytes are already in the peer's receive
+// buffer when the server turns to read them, so a request no larger than the
+// queue appears to complete at an impossible rate. One such sample landing
+// alone in a phase reported more than twice the link rate on a real path.
+func TestUploadIgnoresShortRequests(t *testing.T) {
+	m := newUploadAckMeter()
+	m.noteWrite(time.Now(), 12*time.Second)
+
+	// A request that ran long enough for transfer to dominate: 100 kB/s.
+	m.ack(time.Now().Add(-2*time.Second), 200_000)
+	// A short one that measured the queue rather than the link: 750 kB/s.
+	m.ack(time.Now().Add(-100*time.Millisecond), 75_000)
+
+	const want = 100_000.0 // bytes/sec, from the qualifying request alone
+	if got := m.rate(1); got > want*1.05 {
+		t.Errorf("rate %.0f B/s, want about %.0f — the queue-inflated request is being counted", got, want)
+	}
+}
+
 // TestUploadPayloadRampIsBounded pins the sizing regression found while
 // building this: the first request is small enough that its duration is all
 // overhead, so the rate derived from it can be orders of magnitude too high. An
@@ -85,8 +125,7 @@ func TestUploadRateMatchesWireRate(t *testing.T) {
 // with only the bad sample it started from.
 func TestUploadPayloadRampIsBounded(t *testing.T) {
 	m := newUploadAckMeter()
-	start := time.Now()
-	m.noteWrite(start, 12*time.Second)
+	m.noteWrite(time.Now(), 12*time.Second)
 
 	// A minimum-size request that appeared to complete instantly.
 	m.ack(time.Now(), minUploadPayload)
@@ -101,16 +140,13 @@ func TestUploadPayloadRampIsBounded(t *testing.T) {
 // window, or it is cancelled before the server can acknowledge it.
 func TestUploadPayloadFitsRemainingWindow(t *testing.T) {
 	m := newUploadAckMeter()
-	start := time.Now()
-	m.noteWrite(start, time.Second)
+	// A phase already sized up on a fast link, with one second left to run.
+	m.payload = 64 << 20
+	m.lastRate = 4 << 20 // bytes/sec
+	m.deadline = time.Now().Add(time.Second)
 
-	// 8 MiB/s observed over a full second: the unclamped payload would be 16 MiB,
-	// which cannot complete in the fraction of a second still left.
-	m.ack(start, 8<<20)
-
-	got := m.nextPayload()
-	if got > 8<<20 {
-		t.Errorf("payload %d ignores the %v left in the window", got, time.Until(start.Add(time.Second)))
+	if got, max := m.nextPayload(), int64(2<<20); got > max {
+		t.Errorf("payload %d ignores that only a second of the window is left", got)
 	}
 }
 

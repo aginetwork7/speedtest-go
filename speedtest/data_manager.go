@@ -34,6 +34,7 @@ type Manager interface {
 	// for why the byte counters above cannot answer this for uploads.
 	NextUploadPayload() int64
 	AckUpload(writeStart time.Time, written int64)
+	SetUploadLatency(d time.Duration)
 	GetAckedUploadRate() float64
 
 	SetCallbackDownload(callback func(downRate ByteRate))
@@ -402,8 +403,14 @@ func (dm *DataManager) AckUpload(writeStart time.Time, written int64) {
 	dm.upload.ackMeter.ack(writeStart, written)
 }
 
+// SetUploadLatency supplies the round trip the latency phase measured, so that
+// the wait for each acknowledgement is not charged to the link.
+func (dm *DataManager) SetUploadLatency(d time.Duration) {
+	dm.upload.ackMeter.setLatency(d)
+}
+
 func (dm *DataManager) GetAckedUploadRate() float64 {
-	return dm.upload.ackMeter.rate()
+	return dm.upload.ackMeter.rate(dm.nThread)
 }
 
 func (dm *DataManager) GetEWMAUploadRate() float64 {

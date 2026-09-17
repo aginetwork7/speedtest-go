@@ -91,6 +91,7 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	if td == nil {
 		return ErrorUninitializedManager
 	}
+	td.manager.SetUploadLatency(s.Latency)
 	td.Start(_context, cancel, mainIDIndex) // block here
 	s.ULSpeed = ByteRate(td.manager.GetAckedUploadRate())
 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
@@ -145,6 +146,7 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	var requestTimes int64 = 0
 	start := time.Now()
 	_context, cancel := context.WithCancel(ctx)
+	s.Context.SetUploadLatency(s.Latency)
 	s.Context.RegisterUploadHandler(func() {
 		atomic.AddInt64(&requestTimes, 1)
 		if err := uploadRequest(_context, s); err != nil {

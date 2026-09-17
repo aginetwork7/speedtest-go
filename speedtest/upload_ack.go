@@ -11,22 +11,35 @@ import (
 // The two are not the same quantity. A download counts bytes returned by Read,
 // which have arrived; an upload counting bytes returned by Write counts bytes
 // that are merely queued — HTTP buffer, kernel send buffer, bandwidth-delay
-// product and the peer's receive window, together around a megabyte. That queue
-// is a fixed size, so its share of the measurement grows as the link slows, and
-// cutting a phase mid-request banks the whole of it as sent. Against an origin
-// that counted the bytes it actually received, that read +92% on an 819 kbps
-// link while the download in the same run read -1%.
+// product and the peer's receive window. An HTTP response is the one
+// per-request acknowledgement that cannot be inflated that way: the server
+// sends it only after reading the whole body.
 //
-// An HTTP response is the one per-request acknowledgement that cannot be
-// inflated this way: the server sends it only after reading the whole body.
-// Measuring acknowledged bytes over the time it took to have them acknowledged
-// reproduced the wire rate exactly at 819 kbps and 3.3 Mbps.
+// Two corrections make that signal usable, both found on a real 800 kbps path
+// where the uncorrected version read 19% low with occasional readings at more
+// than twice the link rate:
+//
+//   - The round trip is not transfer time. A worker waits a full round trip
+//     between writing its last byte and being told the body arrived, and it
+//     sends nothing during that wait. Charging it to the link understates a
+//     long path badly — 19% at 335 ms — and by an amount that grows with
+//     distance, so the same device reads differently against two endpoints.
+//
+//   - Short requests measure the queue, not the link. On a reused connection
+//     the next request's bytes are already sitting in the peer's receive buffer
+//     when the server turns to read them, so a request no larger than the queue
+//     appears to complete at an impossible rate — measured at 1463 kbps on that
+//     same 800 kbps path. Requests that ran long enough for transfer to
+//     dominate are the only ones that measure anything.
 const (
 	// targetRequestDuration is how long one upload request should take. Long
-	// enough that per-request overhead — connection setup, headers, the
-	// server's response — stays a small share of it, short enough that a
-	// capture window collects several acknowledgements.
+	// enough that per-request overhead stays a small share of it, short enough
+	// that a capture window collects several acknowledgements.
 	targetRequestDuration = 2 * time.Second
+
+	// minQualifiedTransfer is the transfer time below which a request tells us
+	// more about the queue and the round trip than about the link.
+	minQualifiedTransfer = targetRequestDuration / 2
 
 	// minUploadPayload bounds how slow a link can be and still have one request
 	// acknowledged inside the shortest usable capture window: 16 KiB needs
@@ -51,12 +64,6 @@ const (
 	// cancelled before the server answers, so it is never acknowledged and its
 	// bytes are measured by nothing.
 	completionSafetyFactor = 0.5
-
-	// settledGrowthRatio is the point at which the payload is considered sized
-	// for the link. Below this, the request is still ramping and its duration
-	// is dominated by round trips rather than by bandwidth, so counting it
-	// would drag the reported rate down.
-	settledGrowthRatio = 1.5
 )
 
 // uploadAckMeter sizes upload requests and derives the rate from the ones the
@@ -65,25 +72,35 @@ const (
 type uploadAckMeter struct {
 	mu sync.Mutex
 
-	payload  int64     // body size for the next request
-	settled  bool      // the payload has stopped ramping
-	lastRate float64   // bytes/sec from the most recent acknowledgement
-	deadline time.Time // when the capture window closes
+	payload  int64         // body size for the next request
+	latency  time.Duration // measured round trip, excluded from transfer time
+	lastRate float64       // bytes/sec from the most recent acknowledgement
+	deadline time.Time     // when the capture window closes
 
-	// all covers every acknowledged request in the phase. It is the fallback
-	// for a phase that ended before the ramp settled, where discarding the ramp
-	// would leave nothing at all.
-	allStart, allLast time.Time
-	allAcked          int64
+	// qualified holds requests that ran long enough to measure the link.
+	qualBytes   int64
+	qualSeconds float64
 
-	// steady covers only requests that began after the payload settled, which
-	// is the window that reflects the link rather than the ramp.
-	steadyStart, steadyLast time.Time
-	steadyAcked             int64
+	// all holds every acknowledged request, as a fallback for a phase that
+	// ended before any request qualified. Better a reading drawn from short
+	// requests than no reading at all.
+	allBytes   int64
+	allSeconds float64
 }
 
 func newUploadAckMeter() *uploadAckMeter {
 	return &uploadAckMeter{payload: minUploadPayload}
+}
+
+// setLatency supplies the round trip measured by the latency phase. Left at
+// zero — no latency phase ran — no correction is applied, which reads low
+// rather than inventing a number.
+func (m *uploadAckMeter) setLatency(d time.Duration) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if d > 0 {
+		m.latency = d
+	}
 }
 
 // nextPayload reports how large the next request body should be.
@@ -107,47 +124,48 @@ func (m *uploadAckMeter) nextPayload() int64 {
 	return payload
 }
 
-// noteWrite records when the phase first put a byte on the wire. The rate is
-// measured from here rather than from the phase's start so that it excludes
-// the caller's own setup.
+// noteWrite records when the phase first put a byte on the wire, which is what
+// the capture window is counted from.
 func (m *uploadAckMeter) noteWrite(at time.Time, window time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if m.allStart.IsZero() {
-		m.allStart = at
+	if m.deadline.IsZero() {
 		m.deadline = at.Add(window)
 	}
 }
 
 // ack records that the server acknowledged n bytes from a request that began
-// writing at reqStart, and resizes the next request from what that one achieved.
+// writing at reqStart, and resizes the next request from what that one
+// achieved.
 func (m *uploadAckMeter) ack(reqStart time.Time, n int64) {
-	if n <= 0 {
+	if n <= 0 || reqStart.IsZero() {
 		return
 	}
-	now := time.Now()
+	elapsed := time.Since(reqStart)
 
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.allStart.IsZero() || reqStart.Before(m.allStart) {
-		m.allStart = reqStart
+	// The round trip is wall clock the worker spent waiting rather than
+	// sending. Subtracting more than the request took would invent throughput,
+	// so an implausible latency is ignored instead.
+	transfer := elapsed - m.latency
+	if transfer <= 0 {
+		transfer = elapsed
 	}
-	m.allAcked += n
-	m.allLast = now
-
-	// Requests already in flight when the window opened carry bytes from before
-	// it and would inflate the steady rate, so only later ones count.
-	if m.settled && !reqStart.Before(m.steadyStart) {
-		m.steadyAcked += n
-		m.steadyLast = now
-	}
-
-	elapsed := now.Sub(reqStart)
-	if elapsed <= 0 {
+	seconds := transfer.Seconds()
+	if seconds <= 0 {
 		return
 	}
-	m.lastRate = float64(n) / elapsed.Seconds()
+
+	m.allBytes += n
+	m.allSeconds += seconds
+	if transfer >= minQualifiedTransfer {
+		m.qualBytes += n
+		m.qualSeconds += seconds
+	}
+
+	m.lastRate = float64(n) / seconds
 	next := int64(m.lastRate * targetRequestDuration.Seconds())
 	if capped := m.payload * maxGrowthFactor; next > capped {
 		next = capped
@@ -157,24 +175,27 @@ func (m *uploadAckMeter) ack(reqStart time.Time, n int64) {
 	} else if next > maxUploadPayload {
 		next = maxUploadPayload
 	}
-	if !m.settled && float64(next) <= float64(m.payload)*settledGrowthRatio {
-		m.settled = true
-		m.steadyStart = now
-	}
 	m.payload = next
 }
 
 // rate reports the acknowledged upload rate in bytes per second, or 0 when
 // nothing was acknowledged.
-func (m *uploadAckMeter) rate() float64 {
+//
+// workers is how many requests ran concurrently. Their transfer times overlap
+// in wall clock, so the summed transfer time has to be divided back down to the
+// wall time the link was actually busy.
+func (m *uploadAckMeter) rate(workers int) float64 {
+	if workers < 1 {
+		workers = 1
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 
-	if m.steadyAcked > 0 && m.steadyLast.After(m.steadyStart) {
-		return float64(m.steadyAcked) / m.steadyLast.Sub(m.steadyStart).Seconds()
+	if m.qualSeconds > 0 {
+		return float64(m.qualBytes) / (m.qualSeconds / float64(workers))
 	}
-	if m.allAcked > 0 && m.allLast.After(m.allStart) {
-		return float64(m.allAcked) / m.allLast.Sub(m.allStart).Seconds()
+	if m.allSeconds > 0 {
+		return float64(m.allBytes) / (m.allSeconds / float64(workers))
 	}
 	return 0
 }
