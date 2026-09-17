@@ -18,12 +18,11 @@ import (
 
 type (
 	downloadFunc func(context.Context, *Server, int) error
-	uploadFunc   func(context.Context, *Server, int) error
+	uploadFunc   func(context.Context, *Server) error
 )
 
 var (
 	dlSizes = [...]int{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
-	ulSizes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000} // kB
 )
 
 var (
@@ -84,7 +83,7 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 		dbg.Printf("Register Upload Handler: %s\n", sp.URL)
 		td = server.Context.RegisterUploadHandler(func() {
 			atomic.AddInt64(&requestTimes, 1)
-			if err := uploadRequest(_context, sp, 3); err != nil {
+			if err := uploadRequest(_context, sp); err != nil {
 				atomic.AddInt64(&errorTimes, 1)
 			}
 		})
@@ -93,7 +92,7 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 		return ErrorUninitializedManager
 	}
 	td.Start(_context, cancel, mainIDIndex) // block here
-	s.ULSpeed = ByteRate(td.manager.GetEWMAUploadRate())
+	s.ULSpeed = ByteRate(td.manager.GetAckedUploadRate())
 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
 		s.ULSpeed = -1 // N/A
 	}
@@ -148,12 +147,12 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	_context, cancel := context.WithCancel(ctx)
 	s.Context.RegisterUploadHandler(func() {
 		atomic.AddInt64(&requestTimes, 1)
-		if err := uploadRequest(_context, s, 4); err != nil {
+		if err := uploadRequest(_context, s); err != nil {
 			atomic.AddInt64(&errorTimes, 1)
 		}
 	}).Start(_context, cancel, 0)
 	duration := time.Since(start)
-	s.ULSpeed = ByteRate(s.Context.GetEWMAUploadRate())
+	s.ULSpeed = ByteRate(s.Context.GetAckedUploadRate())
 	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
 		s.ULSpeed = -1 // N/A
 	}
@@ -217,9 +216,16 @@ func downloadRequest(ctx context.Context, s *Server, w int) error {
 	return s.Context.NewChunk().DownloadHandler(resp.Body)
 }
 
-func uploadRequest(ctx context.Context, s *Server, w int) error {
-	size := ulSizes[w]
-	dc := s.Context.NewChunk().UploadHandler(int64(size*100-51) * 10)
+// uploadRequest sends one upload request and, if the server answers, reports
+// the bytes it acknowledged.
+//
+// It takes no size index: the body size comes from the acknowledgement meter,
+// which sizes each request from what the previous one achieved. The former
+// fixed 976 KiB body takes 80 seconds on a 100 kbps link, so no request would
+// be acknowledged inside a capture window at all — on exactly the links this
+// client exists to measure.
+func uploadRequest(ctx context.Context, s *Server) error {
+	dc := s.Context.NewChunk().UploadHandler(s.Context.NextUploadPayload())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, io.NopCloser(dc))
 	if err != nil {
 		return err
@@ -234,7 +240,12 @@ func uploadRequest(ctx context.Context, s *Server, w int) error {
 		return err
 	}
 	defer resp.Body.Close()
-	return err
+	// The response is sent only after the server has read the whole body, so
+	// its arrival is what proves these bytes crossed the wire. A request cut
+	// short by the capture window still ends with a well-formed chunked body
+	// and is acknowledged for what it did send.
+	s.Context.AckUpload(dc.WriteSpan())
+	return nil
 }
 
 // PingTest executes test to measure latency

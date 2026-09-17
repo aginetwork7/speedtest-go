@@ -30,6 +30,12 @@ type Manager interface {
 	GetEWMADownloadRate() float64
 	GetEWMAUploadRate() float64
 
+	// Upload rate measured against server acknowledgements. See upload_ack.go
+	// for why the byte counters above cannot answer this for uploads.
+	NextUploadPayload() int64
+	AckUpload(writeStart time.Time, written int64)
+	GetAckedUploadRate() float64
+
 	SetCallbackDownload(callback func(downRate ByteRate))
 	SetCallbackUpload(callback func(upRate ByteRate))
 
@@ -51,6 +57,10 @@ type Chunk interface {
 	GetRate() float64
 	GetDuration() time.Duration
 	GetParent() Manager
+
+	// WriteSpan reports when this chunk put its first byte on the wire and how
+	// many bytes it wrote, which is what the server acknowledges by responding.
+	WriteSpan() (start time.Time, written int64)
 
 	Read(b []byte) (n int, err error)
 }
@@ -103,15 +113,20 @@ type TestDirection struct {
 	welford         *internal.Welford           // std/EWMA/mean
 	captureCallback func(realTimeRate ByteRate) // user callback
 	closeFunc       func()                      // close func
+	ackMeter        *uploadAckMeter             // upload only, see upload_ack.go
 	*funcGroup                                  // actually exec function
 }
 
 func (dm *DataManager) NewDataDirection(testType int) *TestDirection {
-	return &TestDirection{
+	td := &TestDirection{
 		TestType:  testType,
 		manager:   dm,
 		funcGroup: &funcGroup{},
 	}
+	if testType == typeUpload {
+		td.ackMeter = newUploadAckMeter()
+	}
+	return td
 }
 
 func NewDataManager() *DataManager {
@@ -379,6 +394,18 @@ func (dm *DataManager) GetAvgUploadRate() float64 {
 	return float64(dm.upload.GetTotalDataVolume()*8/1000) / unit
 }
 
+func (dm *DataManager) NextUploadPayload() int64 {
+	return dm.upload.ackMeter.nextPayload()
+}
+
+func (dm *DataManager) AckUpload(writeStart time.Time, written int64) {
+	dm.upload.ackMeter.ack(writeStart, written)
+}
+
+func (dm *DataManager) GetAckedUploadRate() float64 {
+	return dm.upload.ackMeter.rate()
+}
+
 func (dm *DataManager) GetEWMAUploadRate() float64 {
 	if dm.upload.welford != nil {
 		return dm.upload.welford.EWMA()
@@ -394,6 +421,7 @@ type DataChunk struct {
 	err                 error
 	ContentLength       int64
 	remainOrDiscardSize int64
+	writeStart          time.Time
 }
 
 var blackHolePool = sync.Pool{
@@ -473,6 +501,12 @@ func (dc *DataChunk) GetParent() Manager {
 }
 
 // WriteTo Used to hook all traffic.
+// WriteSpan reports when this chunk began writing and how much it wrote. A
+// chunk that never got to write reports a zero time and zero bytes.
+func (dc *DataChunk) WriteSpan() (time.Time, int64) {
+	return dc.writeStart, dc.ContentLength - dc.remainOrDiscardSize
+}
+
 func (dc *DataChunk) WriteTo(w io.Writer) (written int64, err error) {
 	nw := 0
 	nr := readChunkSize
@@ -489,6 +523,12 @@ func (dc *DataChunk) WriteTo(w io.Writer) (written int64, err error) {
 		if !running || dc.remainOrDiscardSize <= 0 {
 			dc.endTime = time.Now()
 			return written, nil
+		}
+		if dc.writeStart.IsZero() {
+			// Rate is measured from the first byte on the wire, so that
+			// connection setup is not charged to the link.
+			dc.writeStart = time.Now()
+			dc.manager.upload.ackMeter.noteWrite(dc.writeStart, dc.manager.captureTime)
 		}
 		if dc.remainOrDiscardSize < readChunkSize {
 			nr = int(dc.remainOrDiscardSize)
