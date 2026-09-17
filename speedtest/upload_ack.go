@@ -67,8 +67,8 @@ const (
 )
 
 // uploadAckMeter sizes upload requests and derives the rate from the ones the
-// server acknowledged. It is created per phase and is safe for concurrent use
-// by the phase's workers.
+// server acknowledged. It lives as long as its direction, is cleared at the
+// start of every phase, and is safe for concurrent use by the phase's workers.
 type uploadAckMeter struct {
 	mu sync.Mutex
 
@@ -101,6 +101,18 @@ func (m *uploadAckMeter) setLatency(d time.Duration) {
 	if d > 0 {
 		m.latency = d
 	}
+}
+
+// reset clears what a phase measured. The latency is left in place: it belongs
+// to the path, and it is supplied before the phase starts.
+func (m *uploadAckMeter) reset() {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	m.payload = minUploadPayload
+	m.lastRate = 0
+	m.deadline = time.Time{}
+	m.qualBytes, m.qualSeconds = 0, 0
+	m.allBytes, m.allSeconds = 0, 0
 }
 
 // nextPayload reports how large the next request body should be.

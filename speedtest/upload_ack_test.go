@@ -204,3 +204,95 @@ func TestUploadRateIgnoresUnacknowledgedBytes(t *testing.T) {
 		t.Errorf("reported %.0f B/s of upload throughput although the server acknowledged nothing", got)
 	}
 }
+
+// A response that rejects the request proves nothing about the link: an error
+// status can be written before the body has been read at all, so counting it
+// would credit the link with bytes it never carried.
+func TestUploadDoesNotAcknowledgeRejectedRequests(t *testing.T) {
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			w.WriteHeader(http.StatusOK) // ping
+			return
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer origin.Close()
+
+	client := New()
+	client.SetCaptureTime(500 * time.Millisecond)
+	client.SetNThread(1)
+	server, err := client.CustomServer(origin.URL)
+	if err != nil {
+		t.Fatalf("CustomServer: %v", err)
+	}
+
+	if err := server.UploadTestContext(context.Background()); err != nil {
+		// Bytes did reach the wire, so the link itself is not the failure.
+		t.Fatalf("UploadTestContext: %v", err)
+	}
+	if rate := client.GetAckedUploadRate(); rate != 0 {
+		t.Fatalf("rejected requests were counted as acknowledged: %v B/s", rate)
+	}
+	if server.ULSpeed != -1 {
+		t.Fatalf("a phase whose every request was rejected must read N/A, got %v", server.ULSpeed)
+	}
+}
+
+// ack() is fed straight from WriteSpan(), which reports a zero time and zero
+// bytes for a chunk that never wrote. Those carry no duration to measure.
+func TestAckMeterIgnoresUnusableSpans(t *testing.T) {
+	meter := newUploadAckMeter()
+
+	meter.ack(time.Time{}, 1<<20)
+	meter.ack(time.Now().Add(-time.Second), 0)
+
+	if rate := meter.rate(1); rate != 0 {
+		t.Fatalf("a meter with no usable sample reported %v B/s", rate)
+	}
+	if payload := meter.nextPayload(); payload != minUploadPayload {
+		t.Fatalf("request sizing moved on an unusable sample: %d", payload)
+	}
+}
+
+// Concurrent requests overlap in wall clock, so their summed transfer time has
+// to be divided back down to the time the link was actually busy. Production
+// runs with more than one connection; every other test here runs with one.
+func TestAckMeterRateDividesBySimultaneousWorkers(t *testing.T) {
+	meter := newUploadAckMeter()
+	start := time.Now().Add(-2 * time.Second)
+	meter.ack(start, 2<<20)
+	meter.ack(start, 2<<20)
+
+	single := meter.rate(1)
+	paired := meter.rate(2)
+	if single <= 0 {
+		t.Fatal("no rate from two acknowledged requests")
+	}
+	if ratio := paired / single; ratio < 1.9 || ratio > 2.1 {
+		t.Fatalf("two workers should read about twice one worker, got %.2fx", ratio)
+	}
+}
+
+// A phase measures itself. The meter outlives the phase, so what it collected
+// has to be cleared when the next one starts — except the latency, which
+// belongs to the path and is supplied before the phase begins.
+func TestAckMeterResetKeepsLatencyOnly(t *testing.T) {
+	meter := newUploadAckMeter()
+	meter.setLatency(50 * time.Millisecond)
+	meter.ack(time.Now().Add(-2*time.Second), 4<<20)
+	if meter.rate(1) == 0 {
+		t.Fatal("no rate to clear")
+	}
+
+	meter.reset()
+
+	if rate := meter.rate(1); rate != 0 {
+		t.Fatalf("the previous phase's samples survived the reset: %v B/s", rate)
+	}
+	if meter.payload != minUploadPayload {
+		t.Fatalf("request sizing survived the reset: %d", meter.payload)
+	}
+	if meter.latency != 50*time.Millisecond {
+		t.Fatalf("the measured round trip was cleared: %v", meter.latency)
+	}
+}
