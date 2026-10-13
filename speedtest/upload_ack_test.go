@@ -250,6 +250,10 @@ func TestUploadRateIgnoresUnacknowledgedBytes(t *testing.T) {
 // A response that rejects the request proves nothing about the link: an error
 // status can be written before the body has been read at all, so counting it
 // would credit the link with bytes it never carried.
+//
+// A phase whose every request was refused has to say so. Reporting it as a
+// phase that merely produced no rate sent an operator looking at the link,
+// when the server had no upload route at all and answered every request 404.
 func TestUploadDoesNotAcknowledgeRejectedRequests(t *testing.T) {
 	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost {
@@ -268,9 +272,8 @@ func TestUploadDoesNotAcknowledgeRejectedRequests(t *testing.T) {
 		t.Fatalf("CustomServer: %v", err)
 	}
 
-	if err := server.UploadTestContext(context.Background()); err != nil {
-		// Bytes did reach the wire, so the link itself is not the failure.
-		t.Fatalf("UploadTestContext: %v", err)
+	if err := server.UploadTestContext(context.Background()); !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf("a phase whose every upload was refused returned %v, want ErrRequestRejected", err)
 	}
 	if rate := client.GetAckedUploadRate(); rate != 0 {
 		t.Fatalf("rejected requests were counted as acknowledged: %v B/s", rate)

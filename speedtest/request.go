@@ -119,7 +119,7 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	if s.ULSpeed == 0 && tally.mostlyFailed() {
 		s.ULSpeed = RateUnavailable
 	}
-	return phaseError(ctx, tally, td.manager.GetTotalUpload()-before)
+	return uploadVerdict(ctx, tally, s.ULSpeed, td.manager.GetTotalUpload()-before)
 }
 
 // DownloadTest executes the test to measure download speed
@@ -182,7 +182,7 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	}
 	s.TestDuration.Upload = &duration
 	s.testDurationTotalCount()
-	return phaseError(ctx, tally, s.Context.GetTotalUpload()-before)
+	return uploadVerdict(ctx, tally, s.ULSpeed, s.Context.GetTotalUpload()-before)
 }
 
 // phaseTally records what one throughput phase attempted, and keeps the last
@@ -299,6 +299,24 @@ func phaseError(ctx context.Context, tally *phaseTally, transferred int64) error
 		return ErrConnectTimeout
 	}
 	return nil
+}
+
+// uploadVerdict is phaseError for an upload phase, which can fail in one way a
+// download cannot: every request leaves bytes on the wire before the server
+// answers, so a server that refuses all of them still looks, by bytes moved,
+// like a phase that ran. When nothing was acknowledged and a refusal is what
+// the phase ended on, the refusal is the verdict — reporting only that no rate
+// came out sent operators to the link while the server had no upload route.
+func uploadVerdict(ctx context.Context, tally *phaseTally, rate ByteRate, transferred int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if rate <= 0 {
+		if cause := tally.cause(); errors.Is(cause, ErrRequestRejected) {
+			return cause
+		}
+	}
+	return phaseError(ctx, tally, transferred)
 }
 
 func downloadRequest(ctx context.Context, s *Server, w int) error {

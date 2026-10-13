@@ -107,3 +107,15 @@ func TestPhaseTallyKeepsTheCauseOverCancellation(t *testing.T) {
 		t.Errorf("a lone cancellation was dropped: cause is %v", cause)
 	}
 }
+
+// Both upload entry points share the verdict; the multi-server one is checked
+// separately so that it cannot drift back to reporting a refused phase as one
+// that ran.
+func TestMultiUploadReportsRejection(t *testing.T) {
+	target := newTestTarget(t, refusingOrigin(t).URL, 500*time.Millisecond, 1)
+
+	err := target.MultiUploadTestContext(context.Background(), Servers{target})
+	if !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf("a multi-server upload phase of refused requests returned %v, want ErrRequestRejected", err)
+	}
+}
