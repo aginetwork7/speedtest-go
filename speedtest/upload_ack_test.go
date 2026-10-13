@@ -358,11 +358,11 @@ func TestAckMeterDoesNotCreditOneWorkersWaitToAnother(t *testing.T) {
 	}
 }
 
-// When every connection waits at once, the link is idle because of how the
-// test drives it, not because it is slow; that time says nothing about its
-// capacity. Charging it read 0.79-0.84 of the cap on a 1 s testbed where the
-// workers had fallen into step.
-func TestAckMeterExcludesTimeWhenEveryWorkerWaits(t *testing.T) {
+// When every connection waits at once, nothing is delivered for that time, and
+// delivered throughput has to show it. Leaving those seconds out reported what
+// the link could carry while busy, which is not what the test delivered and
+// not what the download side reports.
+func TestAckMeterChargesTimeWhenEveryWorkerWaits(t *testing.T) {
 	const (
 		rtt      = time.Second
 		transfer = 2 * time.Second
@@ -374,9 +374,10 @@ func TestAckMeterExcludesTimeWhenEveryWorkerWaits(t *testing.T) {
 	replayWorker(m, base, rtt, transfer, n, 3)
 	replayWorker(m, base, rtt, transfer, n, 3)
 
-	want := 2 * float64(n) / transfer.Seconds()
+	// Two requests' worth per transfer-plus-wait cycle.
+	want := 2 * float64(n) / (transfer + rtt).Seconds()
 	if got := m.rate(); got < want*0.98 || got > want*1.02 {
-		t.Fatalf("rate %.0f B/s, want %.0f — time when nobody was sending is being charged to the link", got, want)
+		t.Fatalf("rate %.0f B/s, want %.0f — the shared wait is not being charged to the wall clock", got, want)
 	}
 }
 
@@ -396,6 +397,27 @@ func TestAckMeterAddsConcurrentRequests(t *testing.T) {
 	}
 	if ratio := paired.rate() / single.rate(); ratio < 1.98 || ratio > 2.02 {
 		t.Fatalf("two concurrent requests should read twice one, got %.2fx", ratio)
+	}
+}
+
+// Short requests carry real bytes. They are too short to say how fast the link
+// is on their own, but what they delivered was delivered: leaving their bytes
+// out while their seconds stay in the window read 0.83x in the lab, where the
+// last seconds of a phase are full of requests sized down to fit the window.
+func TestAckMeterCountsShortRequestsBytes(t *testing.T) {
+	m := newUploadAckMeter()
+	base := time.Now()
+	// One connection carries a single long request...
+	m.ackAt(base, base.Add(2*time.Second), 200_000)
+	// ...while another carries short ones back to back over the same time.
+	for i := 0; i < 4; i++ {
+		from := base.Add(time.Duration(i) * 500 * time.Millisecond)
+		m.ackAt(from, from.Add(500*time.Millisecond), 50_000)
+	}
+
+	const want = 400_000.0 / 2 // bytes/sec: both connections' bytes over 2 s
+	if got := m.rate(); got < want*0.98 || got > want*1.02 {
+		t.Fatalf("rate %.0f B/s, want %.0f — the short requests' bytes are being left out", got, want)
 	}
 }
 
@@ -419,7 +441,7 @@ func TestAckMeterWindowEndsAtTheFirstUnacknowledgedRequest(t *testing.T) {
 
 	// Both connections send in step until the second is abandoned; past that
 	// point only the first one's traffic is known.
-	want := 2 * float64(n) / transfer.Seconds()
+	want := 2 * float64(n) / (transfer + rtt).Seconds()
 	if got := m.rate(); got < want*0.98 || got > want*1.02 {
 		t.Fatalf("rate %.0f B/s, want %.0f — the window ran past a request whose bytes were never counted", got, want)
 	}
@@ -452,16 +474,16 @@ func TestAckMeterOverrunDoesNotCollapseTheWindow(t *testing.T) {
 	// testbed phase this pins.
 	m.abandonAt(steady, steady.Add(4*(transfer+rtt)))
 
-	want := 2 * float64(n) / transfer.Seconds()
+	want := 2 * float64(n) / (transfer + rtt).Seconds()
 	if got := m.rate(); got < want*0.98 || got > want*1.02 {
 		t.Fatalf("rate %.0f B/s, want %.0f from the two connections whose traffic is known", got, want)
 	}
 }
 
 // The first requests are small by design and spend most of their time on round
-// trips, so the start of a phase carries far less than the link can, and the
-// little they carry is credited to an interval the queue compressed. They do
-// not qualify, so they count towards neither the bytes nor the time.
+// trips, so the start of a phase carries far less than the link can. The window
+// opens with the first request long enough to measure the link; opening it at
+// the first request read 0.83x in the lab with eight connections at 250 ms.
 func TestAckMeterWindowSkipsTheRamp(t *testing.T) {
 	const rtt = 300 * time.Millisecond
 	m := newUploadAckMeter()
@@ -474,11 +496,11 @@ func TestAckMeterWindowSkipsTheRamp(t *testing.T) {
 		m.ackAt(start, at, 16<<10)
 		start = at
 	}
-	// Steady state: 100 kB/s while sending.
+	// Steady state: 200 kB per transfer-plus-wait cycle.
 	steady := start
 	replayWorker(m, steady, rtt, 2*time.Second, 200_000, 4)
 
-	want := 200_000 / (2 * time.Second).Seconds()
+	want := 200_000 / (2*time.Second + rtt).Seconds()
 	if got := m.rate(); got < want*0.97 || got > want*1.03 {
 		t.Fatalf("rate %.0f B/s, want %.0f — the ramp is being averaged into the steady rate", got, want)
 	}
@@ -541,6 +563,43 @@ type pacedOrigin struct {
 
 	mu   sync.Mutex
 	next time.Time
+
+	// received is the server's own count of body bytes over time: the truth
+	// the measurement is checked against.
+	recvMu   sync.Mutex
+	received []receivedAt
+}
+
+type receivedAt struct {
+	at    time.Time
+	total int64
+}
+
+func (o *pacedOrigin) count(n int) {
+	o.recvMu.Lock()
+	defer o.recvMu.Unlock()
+	var total int64
+	if len(o.received) > 0 {
+		total = o.received[len(o.received)-1].total
+	}
+	o.received = append(o.received, receivedAt{time.Now(), total + int64(n)})
+}
+
+// deliveredBetween reports the bytes per second the server received in [from, to].
+func (o *pacedOrigin) deliveredBetween(from, to time.Time) float64 {
+	o.recvMu.Lock()
+	defer o.recvMu.Unlock()
+	at := func(t time.Time) int64 {
+		var total int64
+		for _, r := range o.received {
+			if r.at.After(t) {
+				break
+			}
+			total = r.total
+		}
+		return total
+	}
+	return float64(at(to)-at(from)) / to.Sub(from).Seconds()
 }
 
 // wait blocks until n more bytes fit under the shared cap.
@@ -568,6 +627,7 @@ func (o *pacedOrigin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		n, err := r.Body.Read(buf)
 		if n > 0 {
 			o.wait(n)
+			o.count(n)
 		}
 		if err != nil {
 			break
@@ -578,21 +638,27 @@ func (o *pacedOrigin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 // The end-to-end form of the meter tests: with eight connections sharing one
-// capped link, the reading must match the cap whatever the round trip.
+// capped link, the reading must match what the server received per second over
+// the steady part of the phase, whatever the round trip.
 //
-// Per-worker averaging read 1.08-1.19 times the cap at 400 ms and 1 s over
-// three runs each, and this reads 0.94-1.00, so the band is asymmetric: an
-// upper bound of 1.05 sits between the two, and the lower bound leaves room
-// for a reading that errs low, which is the direction this measurement is
-// built to err in. At 0 ms both agree, which keeps the testbed itself honest.
+// The testbed paces reads in user space, so its connections tend to fall into
+// step and leave the link idle together; the server's own count, not the cap,
+// is therefore the truth. Per-worker averaging read high against it and
+// increasingly so with distance, which is the regression this pins.
+//
+// It stops at 400 ms. At 1 s an eight-second phase holds two or three request
+// cycles and the server's own per-second rate swings between 0.8 and 4.2 MB/s,
+// so there is no steady part to compare with; long round trips are covered by
+// the lab in box/tools/speedtest-lab, over a real TCP stack.
 func TestUploadRateDoesNotDriftWithRoundTrip(t *testing.T) {
 	if testing.Short() {
-		t.Skip("runs three eight-second phases")
+		t.Skip("runs two eight-second phases")
 	}
 	const capBytesPerSec = 4 << 20 // 33.5 Mbps
-	for _, rtt := range []time.Duration{0, 400 * time.Millisecond, time.Second} {
+	for _, rtt := range []time.Duration{0, 400 * time.Millisecond} {
 		t.Run(rtt.String(), func(t *testing.T) {
-			origin := httptest.NewServer(&pacedOrigin{bytesPerSec: capBytesPerSec, rtt: rtt})
+			paced := &pacedOrigin{bytesPerSec: capBytesPerSec, rtt: rtt}
+			origin := httptest.NewServer(paced)
 			defer origin.Close()
 
 			client := New()
@@ -606,13 +672,16 @@ func TestUploadRateDoesNotDriftWithRoundTrip(t *testing.T) {
 			// tell transfer from waiting.
 			server.Latency = rtt
 
+			start := time.Now()
 			if err := server.UploadTestContext(context.Background()); err != nil {
 				t.Fatalf("UploadTestContext: %v", err)
 			}
+			end := time.Now()
 			got := float64(server.ULSpeed)
-			if lo, hi := capBytesPerSec*0.9, capBytesPerSec*1.05; got < lo || got > hi {
-				t.Errorf("upload rate %.0f B/s at a %v round trip, want within [%.0f, %.0f] of the %d B/s cap (%.2fx)",
-					got, rtt, lo, hi, capBytesPerSec, got/capBytesPerSec)
+			want := paced.deliveredBetween(start.Add(2*time.Second), end)
+			if lo, hi := want*0.9, want*1.1; got < lo || got > hi {
+				t.Errorf("upload rate %.0f B/s at a %v round trip, want within [%.0f, %.0f] of the %.0f B/s the server received (%.2fx)",
+					got, rtt, lo, hi, want, got/want)
 			}
 		})
 	}

@@ -1,7 +1,6 @@
 package speedtest
 
 import (
-	"sort"
 	"sync"
 	"time"
 )
@@ -35,20 +34,16 @@ import (
 //     same 800 kbps path. Requests that ran long enough for transfer to
 //     dominate are the only ones that measure anything.
 //
-//   - The aggregate is taken over the time the link was busy. The rate used to
-//     be summed bytes over summed per-request transfer time, divided back down
-//     by the number of workers — which assumes every worker is always sending.
-//     Each one idles for a round trip after every request, and on a shared link
-//     the others take up its share, so that assumption read high by an amount
-//     that grows with distance: 1.08-1.19 times the testbed's cap at 400 ms and
-//     1 s, against about 1.10 times the interface counter on the real 250 ms
-//     path. Dividing by plain wall clock instead fails the other way when the
-//     workers fall into step and all wait at once: the link sits idle because
-//     of how the test drives it, not because it is slow, and a 1 s testbed read
-//     0.79-0.84 of its cap. The rate is now the
-//     bytes received while at least one request was transferring, inside the
-//     window described at rate(). On a real path, where workers drift apart,
-//     the link is busy for 98-100% of the window and the two agree.
+//   - The rate is delivered throughput: acknowledged bytes per second of wall
+//     clock inside a steady window. Two other aggregates were tried and
+//     measured against a lab whose server counts what it receives over a real
+//     TCP stack: summing per-request transfer time and dividing by the number
+//     of workers read up to 4x high on a lossy single connection, because it
+//     leaves out every wait between requests; dividing only qualified bytes by
+//     the time qualified requests were in flight read 0.78-0.88x with several
+//     connections at 250 ms, because its window still covered the ramp. The
+//     download side reports bytes read over time, and this is the same
+//     quantity.
 const (
 	// targetRequestDuration is how long one upload request should take. Long
 	// enough that per-request overhead stays a small share of it, short enough
@@ -265,30 +260,26 @@ func (m *uploadAckMeter) abandonAt(reqStart, at time.Time) {
 // rate reports the acknowledged upload rate in bytes per second, or 0 when
 // nothing was acknowledged.
 //
-// It is the bytes the server received from qualified requests, divided by the
-// time during which at least one qualified request was being received, both
-// taken inside a window over which every byte is known:
+// It is the bytes the server acknowledged inside a steady window, divided by
+// the window's wall-clock length:
 //
-//   - The window closes at the earlier of the last acknowledged byte and the
-//     start of the first request that was never acknowledged. Past that point
-//     some of the traffic is unaccounted for, and counting the seconds without
-//     the bytes reads low. The phase waits for every worker before the rate is
-//     read, so every request has been settled one way or the other by then.
+//   - The window opens where the first qualified request began. Before that
+//     the requests are small and mostly round trips, and the link is still
+//     ramping; counting those seconds read 0.83x in the lab.
+//   - It closes where the first request that was never acknowledged began, or
+//     at the last acknowledged byte when none was abandoned. Past an abandoned
+//     request some traffic is unknown; up to it everything is, including the
+//     silence after a connection's last acknowledgement, which is part of what
+//     the test delivered.
 //   - A request that overran — in flight overrunFactor times longer than a
 //     request is sized to take — does not close the window. Closing it there
 //     would throw away the whole phase over one connection; leaving its
 //     unknown bytes out costs at most that connection's share, and reads low.
 //
-// Only qualified requests count, in bytes and in time: a short request's
-// interval is compressed by the queue it measured, so its bytes would be
-// credited to too little time. That is also what leaves out the ramp at the
-// start of a phase, whose requests are small and mostly round trips. Each request's bytes are spread evenly over the
-// interval the server spent receiving it, so one cut by an edge of the window
-// counts only the share that fell inside.
-//
-// When no qualified request falls inside the window, the rate falls back to everything acknowledged over the plain wall clock it
-// spanned, ramp and waits included, bounded by the first abandoned request
-// when that leaves anything; that reads low rather than high.
+// Every acknowledged request counts, qualified or not, with its bytes spread
+// evenly over the interval the server spent receiving it, so one cut by an
+// edge of the window counts only the share that fell inside. When no request
+// qualified, the window opens at the first acknowledged byte instead.
 func (m *uploadAckMeter) rate() float64 {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -297,6 +288,7 @@ func (m *uploadAckMeter) rate() float64 {
 		return 0
 	}
 	first, last := m.acked[0].from, m.acked[0].to
+	var firstQualified time.Time
 	for _, span := range m.acked {
 		if span.from.Before(first) {
 			first = span.from
@@ -304,81 +296,40 @@ func (m *uploadAckMeter) rate() float64 {
 		if span.to.After(last) {
 			last = span.to
 		}
+		if span.qualified && (firstQualified.IsZero() || span.from.Before(firstQualified)) {
+			firstQualified = span.from
+		}
 	}
+
 	end := last
 	overrun := overrunFactor * (targetRequestDuration + m.latency)
+	closed := false
 	for _, a := range m.abandoned {
 		if a.at.Sub(a.from) > overrun {
 			continue
 		}
-		if a.from.Before(end) {
+		if !closed || a.from.Before(end) {
 			end = a.from
+			closed = true
 		}
 	}
 
-	if rate, ok := busyRate(m.acked, first, end); ok {
-		return rate
-	}
-
 	start := first
+	if !firstQualified.IsZero() {
+		start = firstQualified
+	}
 	if !end.After(start) {
-		end = last
+		start, end = first, last
 	}
 	if !end.After(start) {
 		return 0
 	}
+
 	var received float64
 	for _, span := range m.acked {
 		received += span.share(start, end)
 	}
 	return received / end.Sub(start).Seconds()
-}
-
-// busyRate divides the bytes of qualified spans inside [start, end] by the
-// time inside it during which at least one of them was being received. It
-// reports false when no qualified span falls inside.
-func busyRate(spans []ackSpan, start, end time.Time) (float64, bool) {
-	type interval struct{ from, to time.Time }
-	var busy []interval
-	var received float64
-	for _, span := range spans {
-		if !span.qualified {
-			continue
-		}
-		from, to := span.from, span.to
-		if from.Before(start) {
-			from = start
-		}
-		if to.After(end) {
-			to = end
-		}
-		if !to.After(from) {
-			continue
-		}
-		received += span.share(start, end)
-		busy = append(busy, interval{from, to})
-	}
-	if len(busy) == 0 {
-		return 0, false
-	}
-	sort.Slice(busy, func(i, j int) bool { return busy[i].from.Before(busy[j].from) })
-	var total time.Duration
-	cur := busy[0]
-	for _, iv := range busy[1:] {
-		if iv.from.After(cur.to) {
-			total += cur.to.Sub(cur.from)
-			cur = iv
-			continue
-		}
-		if iv.to.After(cur.to) {
-			cur.to = iv.to
-		}
-	}
-	total += cur.to.Sub(cur.from)
-	if total <= 0 {
-		return 0, false
-	}
-	return received / total.Seconds(), true
 }
 
 // share reports how many of the span's bytes the server received inside
