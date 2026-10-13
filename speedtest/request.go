@@ -27,7 +27,31 @@ var (
 
 var (
 	ErrConnectTimeout = errors.New("server connect timeout")
+	// ErrRequestRejected reports that the server answered with an error status.
+	// It is distinct from a connection failure because the remedy is: a
+	// rejected request points at the credential or the endpoint, not the link.
+	ErrRequestRejected = errors.New("request rejected by server")
 )
+
+// checkStatus returns ErrRequestRejected, wrapped with what was asked of whom,
+// unless resp carries a success status.
+//
+// Every request a throughput measurement rests on goes through here. An error
+// status can be written before the request has been served at all — a refused
+// credential is answered without reading the upload body or sending the
+// download one — so treating it as an answer credits the link with traffic it
+// never carried.
+//
+// The latency probe deliberately does not. It measures the round trip, and an
+// error status makes the same round trip as a success; the deployment in fact
+// serves no latency.txt and answers every probe 404. Requiring a success
+// there failed every real run at its first phase.
+func checkStatus(resp *http.Response, what string) error {
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+	return fmt.Errorf("%w: %s %s: %s", ErrRequestRejected, what, resp.Request.URL, resp.Status)
+}
 
 func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
@@ -186,8 +210,20 @@ func (t *phaseTally) note(err error) {
 	atomic.AddInt64(&t.requests, 1)
 	if err != nil {
 		atomic.AddInt64(&t.failures, 1)
+		// Closing a phase cancels whatever is still in flight, so a
+		// cancellation is nearly always the last error to arrive. Letting it
+		// replace the one before would report every failed phase as cancelled
+		// and hide what actually went wrong — a refused credential, an
+		// unreachable host.
+		if isCancellation(err) && t.lastErr.Load() != nil {
+			return
+		}
 		t.lastErr.Store(phaseCause{err: err})
 	}
+}
+
+func isCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
 }
 
 func (t *phaseTally) counts() (requests, failures int64) {
@@ -248,7 +284,13 @@ func phaseError(ctx context.Context, tally *phaseTally, transferred int64) error
 		return nil
 	}
 	if tally.noneSucceeded() {
-		if cause := tally.cause(); cause != nil {
+		cause := tally.cause()
+		// A rejection is an answer, so calling it a connect timeout would send
+		// the operator to check the link instead of the credential.
+		if errors.Is(cause, ErrRequestRejected) {
+			return cause
+		}
+		if cause != nil {
 			// The sentinel stays matchable with errors.Is; the concrete
 			// transport error is what says whether to check the address, the
 			// certificate or the link.
@@ -281,6 +323,12 @@ func downloadRequest(ctx context.Context, s *Server, w int) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if err := checkStatus(resp, "download"); err != nil {
+		// The error body is not the payload; counting it would report the
+		// rejection's own bytes as download throughput.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return err
+	}
 	return s.Context.NewChunk().DownloadHandler(resp.Body)
 }
 
@@ -305,6 +353,10 @@ func uploadRequest(ctx context.Context, s *Server) error {
 	}
 	resp, err := s.Context.doer.Do(req)
 	if err != nil {
+		// Cancelled at the end of the phase, most often. Whatever it wrote may
+		// or may not have arrived, so the rate must not be measured past it.
+		writeStart, _ := dc.WriteSpan()
+		s.Context.AbandonUpload(writeStart)
 		return err
 	}
 	defer resp.Body.Close()
@@ -312,8 +364,10 @@ func uploadRequest(ctx context.Context, s *Server) error {
 	// can be written before the body has been read at all — a rejected size, a
 	// refused credential — and acknowledging that would credit the link with
 	// bytes it never carried, at whatever rate the rejection came back.
-	if resp.StatusCode < http.StatusOK || resp.StatusCode >= http.StatusMultipleChoices {
-		return fmt.Errorf("upload rejected by %s: %s", s.URL, resp.Status)
+	if err := checkStatus(resp, "upload"); err != nil {
+		writeStart, _ := dc.WriteSpan()
+		s.Context.AbandonUpload(writeStart)
+		return err
 	}
 	// The response is sent only after the server has read the whole body, so
 	// its arrival is what proves these bytes crossed the wire. A request cut
@@ -440,7 +494,7 @@ func (s *Server) HTTPPing(
 		resp, err := s.Context.doer.Do(req)
 		endTime := time.Since(sTime)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if isCancellation(err) {
 				contextErr = err
 				break
 			}

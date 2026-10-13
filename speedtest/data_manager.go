@@ -42,11 +42,15 @@ type Manager interface {
 	// start or a non-positive count is ignored, which is what a chunk that
 	// never wrote reports.
 	AckUpload(writeStart time.Time, written int64)
+	// AbandonUpload records a request that wrote bytes and was never
+	// acknowledged. Its bytes are unknown, so the rate is not measured past the
+	// moment it began; writeStart must come from the chunk's WriteSpan().
+	AbandonUpload(writeStart time.Time)
 	// SetUploadLatency supplies the round trip to exclude from transfer time.
 	// It survives the per-phase reset: the round trip belongs to the path.
 	SetUploadLatency(duration time.Duration)
 	// GetAckedUploadRate reports bytes per second across all workers of the
-	// current phase, not per worker.
+	// current phase, not per worker, measured on the wall clock.
 	GetAckedUploadRate() float64
 
 	SetCallbackDownload(callback func(downRate ByteRate))
@@ -429,6 +433,10 @@ func (dm *DataManager) AckUpload(writeStart time.Time, written int64) {
 	dm.upload.ackMeter.ack(writeStart, written)
 }
 
+func (dm *DataManager) AbandonUpload(writeStart time.Time) {
+	dm.upload.ackMeter.abandon(writeStart)
+}
+
 // noteUploadWrite reports the first byte of the phase reaching the wire, which
 // is where the capture window is counted from. It is unexported because only
 // the chunk writer can know that moment.
@@ -443,7 +451,7 @@ func (dm *DataManager) SetUploadLatency(duration time.Duration) {
 }
 
 func (dm *DataManager) GetAckedUploadRate() float64 {
-	return dm.upload.ackMeter.rate(dm.nThread)
+	return dm.upload.ackMeter.rate()
 }
 
 func (dm *DataManager) GetEWMAUploadRate() float64 {

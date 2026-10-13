@@ -231,10 +231,12 @@ func TestPhaseStartClearsTheUploadMeter(t *testing.T) {
 	}
 
 	meter.mu.Lock()
-	seconds := meter.allSeconds
-	meter.mu.Unlock()
-	if seconds > 10 {
-		t.Fatalf("the second phase measured %.0fs of transfer; it only ran for 0.3s, so it inherited the previous phase", seconds)
+	defer meter.mu.Unlock()
+	for _, span := range meter.acked {
+		if time.Since(span.from) > 10*time.Second {
+			t.Fatalf("the second phase holds a request from %.0fs ago; it only ran for 0.3s, so it inherited the previous phase",
+				time.Since(span.from).Seconds())
+		}
 	}
 }
 
