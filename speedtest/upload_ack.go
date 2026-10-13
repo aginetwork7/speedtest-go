@@ -47,12 +47,18 @@ import (
 const (
 	// targetRequestDuration is how long one upload request should take. Long
 	// enough that per-request overhead stays a small share of it, short enough
-	// that a capture window collects several acknowledgements.
-	targetRequestDuration = 2 * time.Second
+	// that a capture window collects several acknowledgements — and short
+	// enough that one request slowed by loss does not outlive the window. At
+	// 2 s, a request sized from the link's opening burst took 11 s on a lossy
+	// link in the lab and its bytes were never acknowledged.
+	targetRequestDuration = time.Second
 
 	// minQualifiedTransfer is the transfer time below which a request tells us
-	// more about the queue and the round trip than about the link.
-	minQualifiedTransfer = targetRequestDuration / 2
+	// more about the queue, the round trip and slow start than about the link.
+	// It is fixed rather than tied to targetRequestDuration: when the target
+	// fell to 1 s a half-second threshold let a 64 KiB slow-start request on a
+	// 250 ms path qualify, open the rate window during the ramp and read 0.81.
+	minQualifiedTransfer = time.Second
 
 	// minUploadPayload bounds how slow a link can be and still have one request
 	// acknowledged inside the shortest usable capture window: 16 KiB needs
@@ -72,6 +78,12 @@ const (
 	// request too large to finish inside the capture window — which leaves the
 	// phase with nothing but the bad sample it started from.
 	maxGrowthFactor = 8
+
+	// maxUnqualifiedGrowth is maxGrowthFactor for a request too short to
+	// qualify. Such a request measures the start of a transfer — the initial
+	// window, an empty queue — and overstates what the link sustains; in the lab
+	// one sized its successor 5x too large for a lossy link.
+	maxUnqualifiedGrowth = 2
 
 	// overrunFactor is how many times a normal request's lifetime — its target
 	// transfer time plus the round trip — an abandoned request must have been
@@ -228,8 +240,13 @@ func (m *uploadAckMeter) ackAt(reqStart, at time.Time, n int64) {
 	// Bounded by this request's own size, not by the shared payload: every
 	// worker's first request is acknowledged at about the same moment, and
 	// bounding by the shared value let each of them multiply the last one's
-	// growth.
-	if capped := n * maxGrowthFactor; next > capped {
+	// growth. A request too short to qualify grows the next less, since what it
+	// measured was the start of a transfer.
+	growth := int64(maxGrowthFactor)
+	if transfer < minQualifiedTransfer {
+		growth = maxUnqualifiedGrowth
+	}
+	if capped := n * growth; next > capped {
 		next = capped
 	}
 	if next < minUploadPayload {

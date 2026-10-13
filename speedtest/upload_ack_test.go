@@ -409,10 +409,11 @@ func TestAckMeterCountsShortRequestsBytes(t *testing.T) {
 	base := time.Now()
 	// One connection carries a single long request...
 	m.ackAt(base, base.Add(2*time.Second), 200_000)
-	// ...while another carries short ones back to back over the same time.
-	for i := 0; i < 4; i++ {
-		from := base.Add(time.Duration(i) * 500 * time.Millisecond)
-		m.ackAt(from, from.Add(500*time.Millisecond), 50_000)
+	// ...while another carries short ones back to back over the same time,
+	// each well under minQualifiedTransfer.
+	for i := 0; i < 8; i++ {
+		from := base.Add(time.Duration(i) * 250 * time.Millisecond)
+		m.ackAt(from, from.Add(250*time.Millisecond), 25_000)
 	}
 
 	const want = 400_000.0 / 2 // bytes/sec: both connections' bytes over 2 s
@@ -585,6 +586,16 @@ func (o *pacedOrigin) count(n int) {
 	o.received = append(o.received, receivedAt{time.Now(), total + int64(n)})
 }
 
+// totalReceived reports every body byte the server has read.
+func (o *pacedOrigin) totalReceived() int64 {
+	o.recvMu.Lock()
+	defer o.recvMu.Unlock()
+	if len(o.received) == 0 {
+		return 0
+	}
+	return o.received[len(o.received)-1].total
+}
+
 // deliveredBetween reports the bytes per second the server received in [from, to].
 func (o *pacedOrigin) deliveredBetween(from, to time.Time) float64 {
 	o.recvMu.Lock()
@@ -684,5 +695,167 @@ func TestUploadRateDoesNotDriftWithRoundTrip(t *testing.T) {
 					got, rtt, lo, hi, want, got/want)
 			}
 		})
+	}
+}
+
+// A request still in flight when the capture window closes has usually been
+// read by the server already; only its acknowledgement is on the way. Cancelling
+// it at once threw that away: in the lab a single lossy connection's last
+// request — 2.9 MB the server logged as received — went unacknowledged, the rate
+// window shrank to the 1.1 s before it, and the reading came out 3x what the
+// phase delivered. The phase now waits a bounded grace for those answers, so
+// every byte the server received is accounted for.
+func TestUploadWaitsForInFlightAcknowledgements(t *testing.T) {
+	const rtt = 600 * time.Millisecond
+	paced := &pacedOrigin{bytesPerSec: 1 << 20, rtt: rtt}
+	origin := httptest.NewServer(paced)
+	defer origin.Close()
+
+	client := New()
+	client.SetCaptureTime(2500 * time.Millisecond)
+	client.SetNThread(1)
+	server, err := client.CustomServer(origin.URL)
+	if err != nil {
+		t.Fatalf("CustomServer: %v", err)
+	}
+	server.Latency = rtt
+	if err := server.UploadTestContext(context.Background()); err != nil {
+		t.Fatalf("UploadTestContext: %v", err)
+	}
+
+	meter := client.Manager.(*DataManager).upload.ackMeter
+	meter.mu.Lock()
+	var acked int64
+	for _, span := range meter.acked {
+		acked += span.n
+	}
+	abandoned := len(meter.abandoned)
+	meter.mu.Unlock()
+	received := paced.totalReceived()
+
+	if abandoned != 0 {
+		t.Errorf("%d request(s) were abandoned at the end of the phase instead of being waited for", abandoned)
+	}
+	if acked != received {
+		t.Errorf("acknowledged %d bytes but the server received %d — some of what it received is unaccounted for", acked, received)
+	}
+}
+
+// A short request measures the start of a transfer — the initial window, a
+// queue still empty — not what the link sustains, so it may only nudge the next
+// request's size. In the lab a 1 MiB request that finished in 0.43 s sized the
+// next at 4.9 MB; on a lossy link that request took 11 s, outlived the capture
+// window and its grace, and left the phase with nothing but its ramp to measure.
+func TestUploadPayloadGrowthFromShortRequestIsBounded(t *testing.T) {
+	const rtt = 110 * time.Millisecond
+	m := newUploadAckMeter()
+	m.setLatency(rtt)
+	base := time.Now()
+	m.noteWrite(base, 10*time.Second)
+	m.ackAt(base, base.Add(431*time.Millisecond+rtt), 1<<20)
+
+	if got, max := m.nextPayload(), int64(maxUnqualifiedGrowth<<20); got > max {
+		t.Errorf("a %v request sized the next at %d bytes; growth from a short request is capped at %d",
+			431*time.Millisecond, got, max)
+	}
+}
+
+// The grace after the capture window has to cover a request slowed by loss, not
+// only an acknowledgement's round trip: one that finished 1 s past a grace of
+// 1 s plus two round trips was thrown away in the lab.
+func TestUploadAckGraceCoversAQuarterOfTheWindow(t *testing.T) {
+	cases := []struct {
+		latency, capture, want time.Duration
+	}{
+		{110 * time.Millisecond, 10 * time.Second, 2500 * time.Millisecond},
+		{2 * time.Second, 4 * time.Second, 5 * time.Second}, // round trips dominate
+	}
+	for _, c := range cases {
+		if got := uploadAckGrace(c.latency, c.capture); got != c.want {
+			t.Errorf("grace for latency %v, capture %v = %v, want %v", c.latency, c.capture, got, c.want)
+		}
+	}
+}
+
+// slowAckOrigin reads each upload body as it arrives and answers a fixed delay
+// after the last byte: a server, or a path, slow to acknowledge.
+type slowAckOrigin struct{ delay time.Duration }
+
+func (o slowAckOrigin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	if r.Method == http.MethodPost {
+		_, _ = io.Copy(io.Discard, r.Body)
+		time.Sleep(o.delay)
+	}
+	w.WriteHeader(http.StatusOK)
+}
+
+// The window share of the grace has to reach the phase itself, not only the
+// helper that computes it. Here the latency phase measured a short round trip,
+// but every answer comes 1.3 s after the body: a grace of a second plus two
+// round trips (1.1 s) gives up on the request in flight at the close, a quarter
+// of the 6 s window (1.5 s) does not.
+func TestUploadGraceUsesTheCaptureWindow(t *testing.T) {
+	origin := httptest.NewServer(slowAckOrigin{delay: 1300 * time.Millisecond})
+	defer origin.Close()
+
+	client := New()
+	client.SetCaptureTime(6 * time.Second)
+	client.SetNThread(1)
+	server, err := client.CustomServer(origin.URL)
+	if err != nil {
+		t.Fatalf("CustomServer: %v", err)
+	}
+	server.Latency = 50 * time.Millisecond
+	if err := server.UploadTestContext(context.Background()); err != nil {
+		t.Fatalf("UploadTestContext: %v", err)
+	}
+
+	meter := client.Manager.(*DataManager).upload.ackMeter
+	meter.mu.Lock()
+	abandoned := len(meter.abandoned)
+	meter.mu.Unlock()
+	if abandoned != 0 {
+		t.Errorf("%d request(s) were given up on although every answer came within a quarter of the window", abandoned)
+	}
+}
+
+// Both upload entry points take their grace from the client's own capture
+// window; a grace computed without it falls back to the round-trip bound alone.
+func TestUploadPhaseGraceUsesTheClientsCaptureWindow(t *testing.T) {
+	client := New()
+	client.SetCaptureTime(10 * time.Second)
+	server, err := client.CustomServer("http://127.0.0.1:1")
+	if err != nil {
+		t.Fatalf("CustomServer: %v", err)
+	}
+	server.Latency = 110 * time.Millisecond
+	if got, want := uploadPhaseGrace(server), 2500*time.Millisecond; got != want {
+		t.Fatalf("upload phase grace %v, want %v from a quarter of the 10 s window", got, want)
+	}
+}
+
+// On a long path slow start keeps even a small request in flight for several
+// round trips, so transfer time alone can call a ramp request qualified. In the
+// lab a 64 KiB request took 0.54 s at 250 ms, cleared a half-second threshold,
+// and opened the window while the link was still at a fifth of its rate:
+// 0.81 of what the second half of the phase delivered.
+func TestAckMeterSlowStartRequestDoesNotOpenTheWindow(t *testing.T) {
+	const rtt = 250 * time.Millisecond
+	m := newUploadAckMeter()
+	m.setLatency(rtt)
+	base := time.Now()
+	// Ramp: small requests, each mostly round trips and slow start, carrying
+	// about a third of the steady rate — while their transfer times, 0.54 s
+	// and 0.8 s, clear a half-second threshold.
+	m.ackAt(base, base.Add(rtt+540*time.Millisecond), 32<<10)
+	start := base.Add(rtt + 540*time.Millisecond)
+	m.ackAt(start, start.Add(rtt+800*time.Millisecond), 64<<10)
+	// Steady state: 1.25 s transfers of 250 kB, 200 kB/s while sending.
+	steady := start.Add(rtt + 800*time.Millisecond)
+	replayWorker(m, steady, rtt, 1250*time.Millisecond, 250_000, 6)
+
+	want := 250_000 / (1250*time.Millisecond + rtt).Seconds()
+	if got := m.rate(); got < want*0.97 || got > want*1.03 {
+		t.Fatalf("rate %.0f B/s, want %.0f — a slow-start request opened the window", got, want)
 	}
 }

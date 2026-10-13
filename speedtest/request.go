@@ -96,6 +96,8 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	var td *TestDirection
 	_context, cancel := context.WithCancel(ctx)
 	defer cancel()
+	requestCtx, stopRequests := uploadRequestContext(ctx, _context, uploadPhaseGrace(s))
+	defer stopRequests()
 	tally := &phaseTally{}
 	for i, server := range *ss {
 		if server.ID == s.ID {
@@ -104,7 +106,7 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 		sp := server
 		dbg.Printf("Register Upload Handler: %s\n", sp.URL)
 		td = server.Context.RegisterUploadHandler(func() {
-			tally.note(uploadRequest(_context, sp))
+			tally.note(uploadRequest(requestCtx, sp))
 		})
 	}
 	if td == nil {
@@ -168,12 +170,14 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	tally := &phaseTally{}
 	start := time.Now()
 	_context, cancel := context.WithCancel(ctx)
+	requestCtx, stopRequests := uploadRequestContext(ctx, _context, uploadPhaseGrace(s))
+	defer stopRequests()
 	s.Context.SetUploadLatency(s.Latency)
 	// See downloadTestContext: the verdict is about this phase, not about
 	// everything the manager has ever sent.
 	before := s.Context.GetTotalUpload()
 	s.Context.RegisterUploadHandler(func() {
-		tally.note(uploadRequest(_context, s))
+		tally.note(uploadRequest(requestCtx, s))
 	}).Start(_context, cancel, 0)
 	duration := time.Since(start)
 	s.ULSpeed = ByteRate(s.Context.GetAckedUploadRate())
@@ -299,6 +303,77 @@ func phaseError(ctx context.Context, tally *phaseTally, transferred int64) error
 		return ErrConnectTimeout
 	}
 	return nil
+}
+
+// uploadAckGraceBase, uploadAckGraceRoundTrips and uploadAckGraceWindowShare
+// bound how long an upload phase waits, after its capture window closes, for
+// requests already in flight to be acknowledged.
+const (
+	uploadAckGraceBase        = time.Second
+	uploadAckGraceRoundTrips  = 2
+	uploadAckGraceWindowShare = 4 // a quarter of the capture window
+)
+
+// uploadAckGrace is the larger of an acknowledgement's round trips plus a
+// second, and a quarter of the capture window. The round trips cover a request
+// whose last bytes are just arriving; the share of the window covers one slowed
+// by loss, which in the lab finished a second past the round-trip bound and was
+// thrown away with everything it carried.
+func uploadAckGrace(latency, capture time.Duration) time.Duration {
+	grace := uploadAckGraceBase + uploadAckGraceRoundTrips*latency
+	if share := capture / uploadAckGraceWindowShare; share > grace {
+		grace = share
+	}
+	return grace
+}
+
+// uploadPhaseGrace is the grace an upload phase on s waits for in-flight
+// acknowledgements; both upload entry points take it from here.
+func uploadPhaseGrace(s *Server) time.Duration {
+	return uploadAckGrace(s.Latency, captureTimeOf(s))
+}
+
+// captureTimeOf reports the capture window of the manager behind s, or 0 when
+// it is not the stock DataManager.
+func captureTimeOf(s *Server) time.Duration {
+	if dm, ok := s.Context.Manager.(*DataManager); ok {
+		return dm.captureTime
+	}
+	return 0
+}
+
+// uploadRequestContext returns the context upload requests run under, and a
+// function that releases it.
+//
+// It outlives the phase context by a grace period. When the capture window
+// closes the writers stop and no new request starts, but a request in flight
+// has usually been read by the server already, with only its acknowledgement
+// on the way back. Cancelling it with the phase threw those bytes away: the
+// rate window then had to close before them, and on a lossy single connection
+// in the lab that left 1.1 s of a 10 s phase to measure, read 3x high. The
+// grace is set by uploadAckGrace, and it is bounded so that a link that has
+// stalled cannot hold the phase open.
+//
+// A cancellation from the caller is not a window closing on schedule: the
+// request context derives from the caller's, so it stops requests at once
+// without waiting out the grace.
+func uploadRequestContext(caller, phase context.Context, grace time.Duration) (context.Context, context.CancelFunc) {
+	requestCtx, cancel := context.WithCancel(caller)
+	go func() {
+		select {
+		case <-requestCtx.Done():
+			return
+		case <-phase.Done():
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-requestCtx.Done():
+		}
+	}()
+	return requestCtx, cancel
 }
 
 // uploadVerdict is phaseError for an upload phase, which can fail in one way a
