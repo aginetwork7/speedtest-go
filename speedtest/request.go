@@ -18,17 +18,40 @@ import (
 
 type (
 	downloadFunc func(context.Context, *Server, int) error
-	uploadFunc   func(context.Context, *Server, int) error
+	uploadFunc   func(context.Context, *Server) error
 )
 
 var (
 	dlSizes = [...]int{350, 500, 750, 1000, 1500, 2000, 2500, 3000, 3500, 4000}
-	ulSizes = [...]int{100, 300, 500, 800, 1000, 1500, 2500, 3000, 3500, 4000} // kB
 )
 
 var (
 	ErrConnectTimeout = errors.New("server connect timeout")
+	// ErrRequestRejected reports that the server answered with an error status.
+	// It is distinct from a connection failure because the remedy is: a
+	// rejected request points at the credential or the endpoint, not the link.
+	ErrRequestRejected = errors.New("request rejected by server")
 )
+
+// checkStatus returns ErrRequestRejected, wrapped with what was asked of whom,
+// unless resp carries a success status.
+//
+// Every request a throughput measurement rests on goes through here. An error
+// status can be written before the request has been served at all — a refused
+// credential is answered without reading the upload body or sending the
+// download one — so treating it as an answer credits the link with traffic it
+// never carried.
+//
+// The latency probe deliberately does not. It measures the round trip, and an
+// error status makes the same round trip as a success; the deployment in fact
+// serves no latency.txt and answers every probe 404. Requiring a success
+// there failed every real run at its first phase.
+func checkStatus(resp *http.Response, what string) error {
+	if resp.StatusCode >= http.StatusOK && resp.StatusCode < http.StatusMultipleChoices {
+		return nil
+	}
+	return fmt.Errorf("%w: %s %s: %s", ErrRequestRejected, what, resp.Request.URL, resp.Status)
+}
 
 func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
@@ -39,8 +62,7 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 	var td *TestDirection
 	_context, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
+	tally := &phaseTally{}
 	for i, server := range *ss {
 		if server.ID == s.ID {
 			mainIDIndex = i
@@ -48,21 +70,21 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 		sp := server
 		dbg.Printf("Register Download Handler: %s\n", sp.URL)
 		td = server.Context.RegisterDownloadHandler(func() {
-			atomic.AddInt64(&requestTimes, 1)
-			if err := downloadRequest(_context, sp, 3); err != nil {
-				atomic.AddInt64(&errorTimes, 1)
-			}
+			tally.note(downloadRequest(_context, sp, 3))
 		})
 	}
 	if td == nil {
 		return ErrorUninitializedManager
 	}
-	td.Start(cancel, mainIDIndex) // block here
+	// Every server in the list carries the client as its Context, so one
+	// manager accounts for all of them.
+	before := td.manager.GetTotalDownload()
+	td.Start(_context, cancel, mainIDIndex) // block here
 	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
-	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.DLSpeed = -1 // N/A
+	if s.DLSpeed == 0 && tally.mostlyFailed() {
+		s.DLSpeed = RateUnavailable
 	}
-	return nil
+	return phaseError(ctx, tally, td.manager.GetTotalDownload()-before)
 }
 
 func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) error {
@@ -74,8 +96,9 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	var td *TestDirection
 	_context, cancel := context.WithCancel(ctx)
 	defer cancel()
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
+	requestCtx, stopRequests := uploadRequestContext(ctx, _context, uploadPhaseGrace(s))
+	defer stopRequests()
+	tally := &phaseTally{}
 	for i, server := range *ss {
 		if server.ID == s.ID {
 			mainIDIndex = i
@@ -83,21 +106,22 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 		sp := server
 		dbg.Printf("Register Upload Handler: %s\n", sp.URL)
 		td = server.Context.RegisterUploadHandler(func() {
-			atomic.AddInt64(&requestTimes, 1)
-			if err := uploadRequest(_context, sp, 3); err != nil {
-				atomic.AddInt64(&errorTimes, 1)
-			}
+			tally.note(uploadRequest(requestCtx, sp))
 		})
 	}
 	if td == nil {
 		return ErrorUninitializedManager
 	}
-	td.Start(cancel, mainIDIndex) // block here
-	s.ULSpeed = ByteRate(td.manager.GetEWMAUploadRate())
-	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.ULSpeed = -1 // N/A
+	td.manager.SetUploadLatency(s.Latency)
+	// Every server in the list carries the client as its Context, so one
+	// manager accounts for all of them.
+	before := td.manager.GetTotalUpload()
+	td.Start(_context, cancel, mainIDIndex) // block here
+	s.ULSpeed = ByteRate(td.manager.GetAckedUploadRate())
+	if s.ULSpeed == 0 && tally.mostlyFailed() {
+		s.ULSpeed = RateUnavailable
 	}
-	return nil
+	return uploadVerdict(ctx, tally, s.ULSpeed, td.manager.GetTotalUpload()-before)
 }
 
 // DownloadTest executes the test to measure download speed
@@ -111,24 +135,25 @@ func (s *Server) DownloadTestContext(ctx context.Context) error {
 }
 
 func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downloadFunc) error {
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
+	tally := &phaseTally{}
 	start := time.Now()
 	_context, cancel := context.WithCancel(ctx)
+	// What this phase moved, not what the manager has moved since it was
+	// built: the byte counters run for the life of the manager, so a phase
+	// reading them raw would inherit an earlier phase's bytes and call itself
+	// successful on them.
+	before := s.Context.GetTotalDownload()
 	s.Context.RegisterDownloadHandler(func() {
-		atomic.AddInt64(&requestTimes, 1)
-		if err := downloadRequest(_context, s, 3); err != nil {
-			atomic.AddInt64(&errorTimes, 1)
-		}
-	}).Start(cancel, 0)
+		tally.note(downloadRequest(_context, s, 3))
+	}).Start(_context, cancel, 0)
 	duration := time.Since(start)
 	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
-	if s.DLSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.DLSpeed = -1 // N/A
+	if s.DLSpeed == 0 && tally.mostlyFailed() {
+		s.DLSpeed = RateUnavailable
 	}
 	s.TestDuration.Download = &duration
 	s.testDurationTotalCount()
-	return nil
+	return phaseError(ctx, tally, s.Context.GetTotalDownload()-before)
 }
 
 // UploadTest executes the test to measure upload speed
@@ -142,24 +167,231 @@ func (s *Server) UploadTestContext(ctx context.Context) error {
 }
 
 func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc) error {
-	var errorTimes int64 = 0
-	var requestTimes int64 = 0
+	tally := &phaseTally{}
 	start := time.Now()
 	_context, cancel := context.WithCancel(ctx)
+	requestCtx, stopRequests := uploadRequestContext(ctx, _context, uploadPhaseGrace(s))
+	defer stopRequests()
+	s.Context.SetUploadLatency(s.Latency)
+	// See downloadTestContext: the verdict is about this phase, not about
+	// everything the manager has ever sent.
+	before := s.Context.GetTotalUpload()
 	s.Context.RegisterUploadHandler(func() {
-		atomic.AddInt64(&requestTimes, 1)
-		if err := uploadRequest(_context, s, 4); err != nil {
-			atomic.AddInt64(&errorTimes, 1)
-		}
-	}).Start(cancel, 0)
+		tally.note(uploadRequest(requestCtx, s))
+	}).Start(_context, cancel, 0)
 	duration := time.Since(start)
-	s.ULSpeed = ByteRate(s.Context.GetEWMAUploadRate())
-	if s.ULSpeed == 0 && float64(errorTimes)/float64(requestTimes) > 0.1 {
-		s.ULSpeed = -1 // N/A
+	s.ULSpeed = ByteRate(s.Context.GetAckedUploadRate())
+	if s.ULSpeed == 0 && tally.mostlyFailed() {
+		s.ULSpeed = RateUnavailable
 	}
 	s.TestDuration.Upload = &duration
 	s.testDurationTotalCount()
+	return uploadVerdict(ctx, tally, s.ULSpeed, s.Context.GetTotalUpload()-before)
+}
+
+// phaseTally records what one throughput phase attempted, and keeps the last
+// error a request reported.
+//
+// The counters alone cannot say why a phase moved nothing: a refused
+// connection, an expired certificate, a rejected request and a name that does
+// not resolve all increment the same integer. Keeping the error costs one
+// store per failed request and is the only thing that tells an operator which
+// of those happened.
+type phaseTally struct {
+	requests int64
+	failures int64
+
+	lastErr atomic.Value // always a phaseCause
+}
+
+// phaseCause keeps the concrete type stored in lastErr constant. atomic.Value
+// panics when successive stores disagree on type, and the errors arriving here
+// are whatever the transport produced.
+type phaseCause struct{ err error }
+
+// note records the outcome of one request.
+func (t *phaseTally) note(err error) {
+	atomic.AddInt64(&t.requests, 1)
+	if err != nil {
+		atomic.AddInt64(&t.failures, 1)
+		// Closing a phase cancels whatever is still in flight, so a
+		// cancellation is nearly always the last error to arrive. Letting it
+		// replace the one before would report every failed phase as cancelled
+		// and hide what actually went wrong — a refused credential, an
+		// unreachable host.
+		if isCancellation(err) && t.lastErr.Load() != nil {
+			return
+		}
+		t.lastErr.Store(phaseCause{err: err})
+	}
+}
+
+func isCancellation(err error) bool {
+	return errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded)
+}
+
+func (t *phaseTally) counts() (requests, failures int64) {
+	return atomic.LoadInt64(&t.requests), atomic.LoadInt64(&t.failures)
+}
+
+// mostlyFailed reports whether failures crossed the share that has always
+// driven the -1 "N/A" rate sentinel.
+func (t *phaseTally) mostlyFailed() bool {
+	requests, failures := t.counts()
+	if requests == 0 {
+		return false
+	}
+	return float64(failures)/float64(requests) > 0.1
+}
+
+// noneSucceeded reports the two ways a phase can end with nothing usable:
+// no request was ever dispatched, and every dispatched request failed. They
+// are one predicate because the verdict treats them alike, and separate
+// clauses because neither implies the other.
+func (t *phaseTally) noneSucceeded() bool {
+	requests, failures := t.counts()
+	return requests == 0 || failures == requests
+}
+
+// cause reports the last error a request produced, or nil if none did.
+func (t *phaseTally) cause() error {
+	if boxed, ok := t.lastErr.Load().(phaseCause); ok {
+		return boxed.err
+	}
 	return nil
+}
+
+// phaseError reports whether a throughput phase produced anything usable.
+//
+// ctx is the caller's context rather than the derived one, which is always
+// cancelled on the way out as part of closing the phase.
+//
+// Without this verdict a phase reports success no matter what happened, so a
+// caller cannot distinguish an unreachable server from a genuinely idle link:
+// both arrive as a rate of zero and a nil error.
+//
+// transferred is what decides it, not the request tally, and it must be what
+// this phase moved rather than the manager's lifetime total. Closing a phase
+// cancels whatever is still in flight, so on a link too slow to finish one
+// chunk inside the capture window every single request ends cancelled — the
+// former fixed 976 KiB upload needed about 81 KB/s to complete within 12
+// seconds, and a 1.89 MiB download about 162 KB/s. Counting those
+// cancellations as failures reported a working link as unreachable, which
+// excluded exactly the low-bandwidth links this client exists to measure.
+// Bytes on the wire prove the endpoint answered, whatever became of the
+// requests carrying them.
+func phaseError(ctx context.Context, tally *phaseTally, transferred int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if transferred > 0 {
+		return nil
+	}
+	if tally.noneSucceeded() {
+		cause := tally.cause()
+		// A rejection is an answer, so calling it a connect timeout would send
+		// the operator to check the link instead of the credential.
+		if errors.Is(cause, ErrRequestRejected) {
+			return cause
+		}
+		if cause != nil {
+			// The sentinel stays matchable with errors.Is; the concrete
+			// transport error is what says whether to check the address, the
+			// certificate or the link.
+			return fmt.Errorf("%w: %v", ErrConnectTimeout, cause)
+		}
+		return ErrConnectTimeout
+	}
+	return nil
+}
+
+// uploadAckGraceBase, uploadAckGraceRoundTrips and uploadAckGraceWindowShare
+// bound how long an upload phase waits, after its capture window closes, for
+// requests already in flight to be acknowledged.
+const (
+	uploadAckGraceBase        = time.Second
+	uploadAckGraceRoundTrips  = 2
+	uploadAckGraceWindowShare = 4 // a quarter of the capture window
+)
+
+// uploadAckGrace is the larger of an acknowledgement's round trips plus a
+// second, and a quarter of the capture window. The round trips cover a request
+// whose last bytes are just arriving; the share of the window covers one slowed
+// by loss, which in the lab finished a second past the round-trip bound and was
+// thrown away with everything it carried.
+func uploadAckGrace(latency, capture time.Duration) time.Duration {
+	grace := uploadAckGraceBase + uploadAckGraceRoundTrips*latency
+	if share := capture / uploadAckGraceWindowShare; share > grace {
+		grace = share
+	}
+	return grace
+}
+
+// uploadPhaseGrace is the grace an upload phase on s waits for in-flight
+// acknowledgements; both upload entry points take it from here.
+func uploadPhaseGrace(s *Server) time.Duration {
+	return uploadAckGrace(s.Latency, captureTimeOf(s))
+}
+
+// captureTimeOf reports the capture window of the manager behind s, or 0 when
+// it is not the stock DataManager.
+func captureTimeOf(s *Server) time.Duration {
+	if dm, ok := s.Context.Manager.(*DataManager); ok {
+		return dm.captureTime
+	}
+	return 0
+}
+
+// uploadRequestContext returns the context upload requests run under, and a
+// function that releases it.
+//
+// It outlives the phase context by a grace period. When the capture window
+// closes the writers stop and no new request starts, but a request in flight
+// has usually been read by the server already, with only its acknowledgement
+// on the way back. Cancelling it with the phase threw those bytes away: the
+// rate window then had to close before them, and on a lossy single connection
+// in the lab that left 1.1 s of a 10 s phase to measure, read 3x high. The
+// grace is set by uploadAckGrace, and it is bounded so that a link that has
+// stalled cannot hold the phase open.
+//
+// A cancellation from the caller is not a window closing on schedule: the
+// request context derives from the caller's, so it stops requests at once
+// without waiting out the grace.
+func uploadRequestContext(caller, phase context.Context, grace time.Duration) (context.Context, context.CancelFunc) {
+	requestCtx, cancel := context.WithCancel(caller)
+	go func() {
+		select {
+		case <-requestCtx.Done():
+			return
+		case <-phase.Done():
+		}
+		timer := time.NewTimer(grace)
+		defer timer.Stop()
+		select {
+		case <-timer.C:
+			cancel()
+		case <-requestCtx.Done():
+		}
+	}()
+	return requestCtx, cancel
+}
+
+// uploadVerdict is phaseError for an upload phase, which can fail in one way a
+// download cannot: every request leaves bytes on the wire before the server
+// answers, so a server that refuses all of them still looks, by bytes moved,
+// like a phase that ran. When nothing was acknowledged and a refusal is what
+// the phase ended on, the refusal is the verdict — reporting only that no rate
+// came out sent operators to the link while the server had no upload route.
+func uploadVerdict(ctx context.Context, tally *phaseTally, rate ByteRate, transferred int64) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if rate <= 0 {
+		if cause := tally.cause(); errors.Is(cause, ErrRequestRejected) {
+			return cause
+		}
+	}
+	return phaseError(ctx, tally, transferred)
 }
 
 func downloadRequest(ctx context.Context, s *Server, w int) error {
@@ -184,12 +416,25 @@ func downloadRequest(ctx context.Context, s *Server, w int) error {
 		return err
 	}
 	defer resp.Body.Close()
+	if err := checkStatus(resp, "download"); err != nil {
+		// The error body is not the payload; counting it would report the
+		// rejection's own bytes as download throughput.
+		_, _ = io.Copy(io.Discard, resp.Body)
+		return err
+	}
 	return s.Context.NewChunk().DownloadHandler(resp.Body)
 }
 
-func uploadRequest(ctx context.Context, s *Server, w int) error {
-	size := ulSizes[w]
-	dc := s.Context.NewChunk().UploadHandler(int64(size*100-51) * 10)
+// uploadRequest sends one upload request and, if the server answers, reports
+// the bytes it acknowledged.
+//
+// It takes no size index: the body size comes from the acknowledgement meter,
+// which sizes each request from what the previous one achieved. The former
+// fixed 976 KiB body takes 80 seconds on a 100 kbps link, so no request would
+// be acknowledged inside a capture window at all — on exactly the links this
+// client exists to measure.
+func uploadRequest(ctx context.Context, s *Server) error {
+	dc := s.Context.NewChunk().UploadHandler(s.Context.NextUploadPayload())
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, s.URL, io.NopCloser(dc))
 	if err != nil {
 		return err
@@ -201,10 +446,44 @@ func uploadRequest(ctx context.Context, s *Server, w int) error {
 	}
 	resp, err := s.Context.doer.Do(req)
 	if err != nil {
+		// Cancelled at the end of the phase, most often. Whatever it wrote may
+		// or may not have arrived, so the rate must not be measured past it.
+		writeStart, _ := dc.WriteSpan()
+		s.Context.AbandonUpload(writeStart)
 		return err
 	}
-	defer resp.Body.Close()
-	return err
+	defer drainAndClose(resp.Body)
+	// Only a success status proves the server read the body. An error status
+	// can be written before the body has been read at all — a rejected size, a
+	// refused credential — and acknowledging that would credit the link with
+	// bytes it never carried, at whatever rate the rejection came back.
+	if err := checkStatus(resp, "upload"); err != nil {
+		writeStart, _ := dc.WriteSpan()
+		s.Context.AbandonUpload(writeStart)
+		return err
+	}
+	// The response is sent only after the server has read the whole body, so
+	// its arrival is what proves these bytes crossed the wire. A request cut
+	// short by the capture window still ends with a well-formed chunked body
+	// and is acknowledged for what it did send.
+	s.Context.AckUpload(dc.WriteSpan())
+	return nil
+}
+
+// maxUploadReplyDrain bounds how much of an upload reply is read before the
+// response is closed. The upload endpoint answers with a few bytes ("size=N");
+// a reply larger than this is not worth keeping the connection for.
+const maxUploadReplyDrain = 64 << 10
+
+// drainAndClose reads an upload reply to its end before closing it. net/http
+// returns a connection to the pool only when its response body reached EOF;
+// closing one unread discards the connection, so every request paid a fresh
+// handshake and restarted slow start. With one connection at a 300 ms round
+// trip, charging each new connection one round trip, that read 0.22 of the
+// link against 0.63 with the connection reused.
+func drainAndClose(body io.ReadCloser) {
+	_, _ = io.CopyN(io.Discard, body, maxUploadReplyDrain)
+	_ = body.Close()
 }
 
 // PingTest executes test to measure latency
@@ -324,7 +603,7 @@ func (s *Server) HTTPPing(
 		resp, err := s.Context.doer.Do(req)
 		endTime := time.Since(sTime)
 		if err != nil {
-			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+			if isCancellation(err) {
 				contextErr = err
 				break
 			}

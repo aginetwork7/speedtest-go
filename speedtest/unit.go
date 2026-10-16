@@ -43,13 +43,24 @@ const (
 
 type ByteRate float64
 
+// RateUnavailable is the rate a phase reports when it produced no usable
+// number. It prints as "N/A".
+//
+// It is not an error code, and it is deliberately independent of the error a
+// phase returns: the two answer different questions. The error says whether
+// the endpoint could be reached at all; the rate says whether anything
+// measurable came back. An endpoint that accepts the connection, reads the
+// body and then rejects every request leaves a nil error — bytes did cross the
+// wire — and this rate, because none of them were acknowledged.
+const RateUnavailable ByteRate = -1
+
 var globalByteRateUnit UnitType
 
 func (r ByteRate) String() string {
 	if r == 0 {
 		return "0.00 Mbps"
 	}
-	if r == -1 {
+	if r == RateUnavailable {
 		return "N/A"
 	}
 	if globalByteRateUnit != UnitTypeDefaultMbps {
@@ -76,7 +87,7 @@ func (r ByteRate) Byte(formatType UnitType) string {
 	if r == 0 {
 		return "0.00 Mbps"
 	}
-	if r == -1 {
+	if r == RateUnavailable {
 		return "N/A"
 	}
 	return format(float64(r), formatType)
