@@ -469,7 +469,14 @@ type DataChunk struct {
 	err                 error
 	ContentLength       int64
 	remainOrDiscardSize int64
-	writeStart          time.Time
+
+	// writeStart and written are what WriteSpan reports, and are atomic
+	// because it may be called while the body is still being written: net/http
+	// returns from Do as soon as a response arrives, and keeps writing the body
+	// on its own goroutine when the server answered before reading all of it —
+	// a refusal — or the request was cancelled.
+	writeStart atomic.Pointer[time.Time]
+	written    atomic.Int64
 }
 
 var blackHolePool = sync.Pool{
@@ -549,9 +556,14 @@ func (dc *DataChunk) GetParent() Manager {
 }
 
 // WriteSpan reports when this chunk began writing and how much it wrote. A
-// chunk that never got to write reports a zero time and zero bytes.
+// chunk that never got to write reports a zero time and zero bytes. Called
+// while the body is still being written, it reports what was written so far.
 func (dc *DataChunk) WriteSpan() (time.Time, int64) {
-	return dc.writeStart, dc.ContentLength - dc.remainOrDiscardSize
+	var start time.Time
+	if p := dc.writeStart.Load(); p != nil {
+		start = *p
+	}
+	return start, dc.written.Load()
 }
 
 // WriteTo Used to hook all traffic.
@@ -572,11 +584,12 @@ func (dc *DataChunk) WriteTo(w io.Writer) (written int64, err error) {
 			dc.endTime = time.Now()
 			return written, nil
 		}
-		if dc.writeStart.IsZero() {
+		if dc.writeStart.Load() == nil {
 			// Rate is measured from the first byte on the wire, so that
 			// connection setup is not charged to the link.
-			dc.writeStart = time.Now()
-			dc.manager.noteUploadWrite(dc.writeStart, dc.manager.captureTime)
+			now := time.Now()
+			dc.writeStart.Store(&now)
+			dc.manager.noteUploadWrite(now, dc.manager.captureTime)
 		}
 		if dc.remainOrDiscardSize < readChunkSize {
 			nr = int(dc.remainOrDiscardSize)
@@ -590,6 +603,7 @@ func (dc *DataChunk) WriteTo(w io.Writer) (written int64, err error) {
 		n64 := int64(nw)
 		written += n64
 		dc.remainOrDiscardSize -= n64
+		dc.written.Add(n64)
 		dc.manager.AddTotalUpload(n64)
 		if nr != nw {
 			return written, io.ErrShortWrite

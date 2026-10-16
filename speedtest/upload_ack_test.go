@@ -295,6 +295,68 @@ func TestUploadDoesNotAcknowledgeRejectedRequests(t *testing.T) {
 	}
 }
 
+// A server may refuse an upload before reading its body. net/http then returns
+// the response while its own goroutine is still writing that body, so the
+// request's write span is read while the body writer is still updating it.
+// Unsynchronized, that is a data race; this test exists for the race detector,
+// which CI runs it under.
+func TestUploadRejectedMidBodyReadsTheWriteSpanSafely(t *testing.T) {
+	answered := make(chan struct{})
+	release := make(chan struct{})
+	origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Wait for the body to start, then refuse it while the client is still
+		// writing: far more than the socket buffers hold is left unread.
+		_, _ = r.Body.Read(make([]byte, 1))
+		// A complete, empty reply: the client must not have to wait for this
+		// handler to return before it can finish reading the response.
+		w.Header().Set("Content-Length", "0")
+		w.WriteHeader(http.StatusUnauthorized)
+		w.(http.Flusher).Flush()
+		close(answered)
+		<-release
+	}))
+	defer origin.Close()
+	defer close(release)
+
+	client := New()
+	client.SetNThread(1)
+	server, err := client.CustomServer(origin.URL)
+	if err != nil {
+		t.Fatalf("CustomServer: %v", err)
+	}
+	dm := client.Manager.(*DataManager)
+	// The body writer only writes inside a running phase, and the body has to
+	// outlast the refusal for the two to overlap.
+	dm.runningRW.Lock()
+	dm.running = true
+	dm.runningRW.Unlock()
+	defer func() {
+		dm.runningRW.Lock()
+		dm.running = false
+		dm.runningRW.Unlock()
+	}()
+	dm.upload.ackMeter.mu.Lock()
+	dm.upload.ackMeter.payload = 64 << 20
+	dm.upload.ackMeter.mu.Unlock()
+
+	if err := uploadRequest(context.Background(), server); !errors.Is(err, ErrRequestRejected) {
+		t.Fatalf("a refused upload returned %v, want ErrRequestRejected", err)
+	}
+	select {
+	case <-answered:
+	default:
+		t.Fatal("the refusal was not sent while the body was being written; the overlap under test never happened")
+	}
+	// The refusal path records the request as abandoned only when it saw a
+	// write start, which proves the span was read after the writer began.
+	dm.upload.ackMeter.mu.Lock()
+	abandoned := len(dm.upload.ackMeter.abandoned)
+	dm.upload.ackMeter.mu.Unlock()
+	if abandoned != 1 {
+		t.Fatalf("the refused request left %d abandoned entries, want 1", abandoned)
+	}
+}
+
 // ack() is fed straight from WriteSpan(), which reports a zero time and zero
 // bytes for a chunk that never wrote. Those carry no duration to measure.
 func TestAckMeterIgnoresUnusableSpans(t *testing.T) {
