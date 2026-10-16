@@ -3,6 +3,7 @@ package speedtest
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -15,6 +16,11 @@ import (
 // newCountingServer records how many requests each client connection carried,
 // keyed by remote address. A reused connection shows up as one address serving
 // many requests.
+//
+// It answers an upload the way the speedtest upload endpoint does, with a short
+// "size=N" body. An empty reply would hide a client that closes the response
+// unread: net/http hands such a client NoBody and reuses the connection anyway,
+// while a real reply left unread costs the connection.
 func newCountingServer(t *testing.T, onRequest func()) (*httptest.Server, func() map[string]int) {
 	t.Helper()
 
@@ -28,8 +34,11 @@ func newCountingServer(t *testing.T, onRequest func()) (*httptest.Server, func()
 		if onRequest != nil {
 			onRequest()
 		}
-		_, _ = io.Copy(io.Discard, r.Body)
+		n, _ := io.Copy(io.Discard, r.Body)
 		w.WriteHeader(http.StatusOK)
+		if r.Method == http.MethodPost {
+			_, _ = fmt.Fprintf(w, "size=%d", n)
+		}
 	}))
 	t.Cleanup(server.Close)
 

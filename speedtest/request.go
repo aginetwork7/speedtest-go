@@ -452,7 +452,7 @@ func uploadRequest(ctx context.Context, s *Server) error {
 		s.Context.AbandonUpload(writeStart)
 		return err
 	}
-	defer resp.Body.Close()
+	defer drainAndClose(resp.Body)
 	// Only a success status proves the server read the body. An error status
 	// can be written before the body has been read at all — a rejected size, a
 	// refused credential — and acknowledging that would credit the link with
@@ -468,6 +468,22 @@ func uploadRequest(ctx context.Context, s *Server) error {
 	// and is acknowledged for what it did send.
 	s.Context.AckUpload(dc.WriteSpan())
 	return nil
+}
+
+// maxUploadReplyDrain bounds how much of an upload reply is read before the
+// response is closed. The upload endpoint answers with a few bytes ("size=N");
+// a reply larger than this is not worth keeping the connection for.
+const maxUploadReplyDrain = 64 << 10
+
+// drainAndClose reads an upload reply to its end before closing it. net/http
+// returns a connection to the pool only when its response body reached EOF;
+// closing one unread discards the connection, so every request paid a fresh
+// handshake and restarted slow start. With one connection at a 300 ms round
+// trip, charging each new connection one round trip, that read 0.22 of the
+// link against 0.63 with the connection reused.
+func drainAndClose(body io.ReadCloser) {
+	_, _ = io.CopyN(io.Discard, body, maxUploadReplyDrain)
+	_ = body.Close()
 }
 
 // PingTest executes test to measure latency
