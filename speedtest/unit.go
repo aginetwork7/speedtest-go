@@ -48,10 +48,15 @@ type ByteRate float64
 //
 // It is not an error code, and it is deliberately independent of the error a
 // phase returns: the two answer different questions. The error says whether
-// the endpoint could be reached at all; the rate says whether anything
-// measurable came back. An endpoint that accepts the connection, reads the
-// body and then rejects every request leaves a nil error — bytes did cross the
-// wire — and this rate, because none of them were acknowledged.
+// the endpoint answered; the rate says whether anything measurable came back.
+// A phase is given this rate when it measured nothing and most of its requests
+// failed, and the error beside it says which case that was:
+//
+//   - nil: the endpoint answered — some bytes arrived, or some upload was
+//     acknowledged — but too little to measure.
+//   - ErrRequestRejected: the server refused the requests, for example an
+//     endpoint that reads each upload body and then answers 401.
+//   - ErrConnectTimeout: nothing arrived and nothing was acknowledged.
 const RateUnavailable ByteRate = -1
 
 var globalByteRateUnit UnitType

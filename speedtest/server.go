@@ -53,7 +53,8 @@ type Server struct {
 	// DLSpeed and ULSpeed hold what the last phase measured, or
 	// RateUnavailable when it measured nothing. Read them together with the
 	// error the phase returned: a nil error with RateUnavailable means the
-	// endpoint answered but nothing measurable came back.
+	// endpoint answered but nothing measurable came back. See RateUnavailable
+	// for the other pairings.
 	DLSpeed      ByteRate        `json:"dl_speed"`
 	ULSpeed      ByteRate        `json:"ul_speed"`
 	TestDuration TestDuration    `json:"test_duration"`

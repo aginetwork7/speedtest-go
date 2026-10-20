@@ -308,12 +308,21 @@ func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, m
 	// goroutine — leaving it writing the Welford state while the caller reads
 	// the final rate out of it.
 	td.closeFunc()
+}
 
-	// Drop the handlers this run registered. Each closure holds the context
-	// this run has just cancelled, and RegisterUpload/DownloadHandler only
-	// accepts new ones while fewer than nThread are installed — so a caller
-	// starting another phase on this direction would otherwise inherit workers
-	// that can only fail, and with a single thread would get nothing else.
+// dropHandlers removes every handler registered on td.
+//
+// The package's own phases call it once Start returns, because their handlers
+// close over the context of the run that registered them, which Start has just
+// cancelled. RegisterUpload/DownloadHandler only accepts new handlers while
+// fewer than nThread are installed, so the next phase on this direction would
+// otherwise inherit workers that can only fail, and with a single thread would
+// get nothing else.
+//
+// Start itself leaves handlers alone. Ones a caller registered through the
+// exported API belong to that caller, who may start the direction again; a
+// Start that dropped them made the second call panic on an empty task stack.
+func (td *TestDirection) dropHandlers() {
 	td.fns = nil
 }
 

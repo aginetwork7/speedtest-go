@@ -162,6 +162,14 @@ func (m *uploadAckMeter) reset() {
 	m.abandoned = nil
 }
 
+// acknowledged reports how many requests the server has acknowledged since the
+// meter was last reset, which Start does at the beginning of every phase.
+func (m *uploadAckMeter) acknowledged() int {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return len(m.acked)
+}
+
 // nextPayload reports how large the next request body should be.
 func (m *uploadAckMeter) nextPayload() int64 {
 	m.mu.Lock()

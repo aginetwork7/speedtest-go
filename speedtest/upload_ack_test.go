@@ -212,7 +212,8 @@ func (o *hangingOrigin) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 // "queued", so it reports throughput for bytes that never reached anyone. Here
 // the server reads every byte and never acknowledges any: the traffic counter
 // must still see them, because they really were sent and really do cost the
-// customer, while the rate must stay at nothing.
+// customer, while the rate must stay at nothing — and the phase must fail,
+// since nothing it sent is known to have arrived.
 func TestUploadRateIgnoresUnacknowledgedBytes(t *testing.T) {
 	origin := httptest.NewServer(&hangingOrigin{})
 	defer origin.Close()
@@ -225,8 +226,8 @@ func TestUploadRateIgnoresUnacknowledgedBytes(t *testing.T) {
 		t.Fatalf("CustomServer: %v", err)
 	}
 
-	if err := server.UploadTestContext(context.Background()); err != nil {
-		t.Fatalf("UploadTestContext: %v", err)
+	if err := server.UploadTestContext(context.Background()); !errors.Is(err, ErrConnectTimeout) {
+		t.Fatalf("an upload phase with nothing acknowledged returned %v, want ErrConnectTimeout", err)
 	}
 
 	if moved := client.GetTotalUpload(); moved <= 0 {

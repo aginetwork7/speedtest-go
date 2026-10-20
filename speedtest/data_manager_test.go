@@ -1,8 +1,10 @@
 package speedtest
 
 import (
+	"context"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -96,5 +98,36 @@ func TestDynamicRate(t *testing.T) {
 	valid := server.CheckResultValid()
 	if !valid {
 		fmt.Println("Warning: result seems to be wrong. Please test again.")
+	}
+}
+
+// Handlers a caller registers through the exported API belong to that caller.
+// Start used to drop them on its way out, so starting the same direction a
+// second time panicked on an empty task stack.
+func TestStartRunsCallerHandlersAgain(t *testing.T) {
+	client := New()
+	client.SetCaptureTime(100 * time.Millisecond)
+	client.SetNThread(1)
+	var calls atomic.Int64
+	td := client.RegisterDownloadHandler(func() {
+		calls.Add(1)
+		time.Sleep(5 * time.Millisecond)
+	})
+
+	for run := 1; run <= 2; run++ {
+		before := calls.Load()
+		func() {
+			defer func() {
+				if r := recover(); r != nil {
+					t.Fatalf("run %d of the same direction panicked: %v", run, r)
+				}
+			}()
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			td.Start(ctx, cancel, 0)
+		}()
+		if calls.Load() == before {
+			t.Fatalf("run %d did not call the registered handler", run)
+		}
 	}
 }

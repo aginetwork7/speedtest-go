@@ -26,6 +26,19 @@ var (
 )
 
 var (
+	// ErrConnectTimeout reports that nothing came back from the endpoint. The
+	// name predates its current meaning and is kept so existing matches still
+	// compile; it is not limited to timeouts.
+	//
+	// A throughput phase returns it when no request succeeded and nothing
+	// proves the endpoint answered: a download received no bytes, an upload
+	// had no request acknowledged. It then carries the last transport error in
+	// its message — a DNS failure, a TLS error, a refused or reset connection,
+	// a request still unanswered when the window closed — so read the message
+	// to tell them apart; only ErrConnectTimeout itself matches errors.Is. It
+	// is bare when no request was dispatched at all.
+	//
+	// TCPPing, HTTPPing and ICMPPing return it bare when every probe failed.
 	ErrConnectTimeout = errors.New("server connect timeout")
 	// ErrRequestRejected reports that the server answered with an error status.
 	// It is distinct from a connection failure because the remedy is: a
@@ -53,6 +66,16 @@ func checkStatus(resp *http.Response, what string) error {
 	return fmt.Errorf("%w: %s %s: %s", ErrRequestRejected, what, resp.Request.URL, resp.Status)
 }
 
+// MultiDownloadTestContext measures download speed across servers, which must
+// share s's client, and leaves the rate in s.DLSpeed.
+//
+// The returned error says whether the endpoint answered; the rate left in
+// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
+// the endpoint answered: a download received bytes, or an upload had a request
+// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
+// (wrapped) when the server refused the requests, or ErrConnectTimeout. It
+// also fails before measuring when servers has none available, or with
+// ErrorUninitializedManager when none of them registered a handler.
 func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
 	if ss.Len() == 0 {
@@ -80,6 +103,7 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 	// manager accounts for all of them.
 	before := td.manager.GetTotalDownload()
 	td.Start(_context, cancel, mainIDIndex) // block here
+	td.dropHandlers()
 	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && tally.mostlyFailed() {
 		s.DLSpeed = RateUnavailable
@@ -87,6 +111,16 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 	return phaseError(ctx, tally, td.manager.GetTotalDownload()-before)
 }
 
+// MultiUploadTestContext measures upload speed across servers, which must
+// share s's client, and leaves the rate in s.ULSpeed.
+//
+// The returned error says whether the endpoint answered; the rate left in
+// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
+// the endpoint answered: a download received bytes, or an upload had a request
+// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
+// (wrapped) when the server refused the requests, or ErrConnectTimeout. It
+// also fails before measuring when servers has none available, or with
+// ErrorUninitializedManager when none of them registered a handler.
 func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
 	if ss.Len() == 0 {
@@ -117,11 +151,12 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	// manager accounts for all of them.
 	before := td.manager.GetTotalUpload()
 	td.Start(_context, cancel, mainIDIndex) // block here
+	td.dropHandlers()
 	s.ULSpeed = ByteRate(td.manager.GetAckedUploadRate())
 	if s.ULSpeed == 0 && tally.mostlyFailed() {
 		s.ULSpeed = RateUnavailable
 	}
-	return uploadVerdict(ctx, tally, s.ULSpeed, td.manager.GetTotalUpload()-before)
+	return uploadVerdict(ctx, tally, s.ULSpeed, uploadEvidence(td, td.manager.GetTotalUpload()-before))
 }
 
 // DownloadTest executes the test to measure download speed
@@ -130,6 +165,12 @@ func (s *Server) DownloadTest() error {
 }
 
 // DownloadTestContext executes the test to measure download speed, observing the given context.
+//
+// The returned error says whether the endpoint answered; the rate left in
+// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
+// the endpoint answered: a download received bytes, or an upload had a request
+// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
+// (wrapped) when the server refused the requests, or ErrConnectTimeout.
 func (s *Server) DownloadTestContext(ctx context.Context) error {
 	return s.downloadTestContext(ctx, downloadRequest)
 }
@@ -143,9 +184,11 @@ func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downlo
 	// reading them raw would inherit an earlier phase's bytes and call itself
 	// successful on them.
 	before := s.Context.GetTotalDownload()
-	s.Context.RegisterDownloadHandler(func() {
+	td := s.Context.RegisterDownloadHandler(func() {
 		tally.note(downloadRequest(_context, s, 3))
-	}).Start(_context, cancel, 0)
+	})
+	td.Start(_context, cancel, 0)
+	td.dropHandlers()
 	duration := time.Since(start)
 	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && tally.mostlyFailed() {
@@ -162,6 +205,12 @@ func (s *Server) UploadTest() error {
 }
 
 // UploadTestContext executes the test to measure upload speed, observing the given context.
+//
+// The returned error says whether the endpoint answered; the rate left in
+// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
+// the endpoint answered: a download received bytes, or an upload had a request
+// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
+// (wrapped) when the server refused the requests, or ErrConnectTimeout.
 func (s *Server) UploadTestContext(ctx context.Context) error {
 	return s.uploadTestContext(ctx, uploadRequest)
 }
@@ -176,9 +225,11 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	// See downloadTestContext: the verdict is about this phase, not about
 	// everything the manager has ever sent.
 	before := s.Context.GetTotalUpload()
-	s.Context.RegisterUploadHandler(func() {
+	td := s.Context.RegisterUploadHandler(func() {
 		tally.note(uploadRequest(requestCtx, s))
-	}).Start(_context, cancel, 0)
+	})
+	td.Start(_context, cancel, 0)
+	td.dropHandlers()
 	duration := time.Since(start)
 	s.ULSpeed = ByteRate(s.Context.GetAckedUploadRate())
 	if s.ULSpeed == 0 && tally.mostlyFailed() {
@@ -186,7 +237,7 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	}
 	s.TestDuration.Upload = &duration
 	s.testDurationTotalCount()
-	return uploadVerdict(ctx, tally, s.ULSpeed, s.Context.GetTotalUpload()-before)
+	return uploadVerdict(ctx, tally, s.ULSpeed, uploadEvidence(td, s.Context.GetTotalUpload()-before))
 }
 
 // phaseTally records what one throughput phase attempted, and keeps the last
@@ -270,21 +321,23 @@ func (t *phaseTally) cause() error {
 // caller cannot distinguish an unreachable server from a genuinely idle link:
 // both arrive as a rate of zero and a nil error.
 //
-// transferred is what decides it, not the request tally, and it must be what
-// this phase moved rather than the manager's lifetime total. Closing a phase
-// cancels whatever is still in flight, so on a link too slow to finish one
-// chunk inside the capture window every single request ends cancelled — the
-// former fixed 976 KiB upload needed about 81 KB/s to complete within 12
-// seconds, and a 1.89 MiB download about 162 KB/s. Counting those
-// cancellations as failures reported a working link as unreachable, which
-// excluded exactly the low-bandwidth links this client exists to measure.
-// Bytes on the wire prove the endpoint answered, whatever became of the
-// requests carrying them.
-func phaseError(ctx context.Context, tally *phaseTally, transferred int64) error {
+// evidence is what decides it, not the request tally: how much of what this
+// phase did proves the endpoint answered. It must count this phase only, not
+// the manager's lifetime. Closing a phase cancels whatever is still in flight,
+// so on a link too slow to finish one chunk inside the capture window every
+// single request ends cancelled — a 1.89 MiB download needs about 162 KB/s to
+// complete within 12 seconds. Counting those cancellations as failures reported
+// a working link as unreachable, which excluded exactly the low-bandwidth links
+// this client exists to measure.
+//
+// A download passes the bytes it received: they came from the endpoint,
+// whatever became of the requests carrying them. An upload cannot pass the
+// bytes it sent, which are counted when handed to the socket; see uploadVerdict.
+func phaseError(ctx context.Context, tally *phaseTally, evidence int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if transferred > 0 {
+	if evidence > 0 {
 		return nil
 	}
 	if tally.noneSucceeded() {
@@ -376,13 +429,26 @@ func uploadRequestContext(caller, phase context.Context, grace time.Duration) (c
 	return requestCtx, cancel
 }
 
-// uploadVerdict is phaseError for an upload phase, which can fail in one way a
-// download cannot: every request leaves bytes on the wire before the server
-// answers, so a server that refuses all of them still looks, by bytes moved,
-// like a phase that ran. When nothing was acknowledged and a refusal is what
-// the phase ended on, the refusal is the verdict — reporting only that no rate
-// came out sent operators to the link while the server had no upload route.
-func uploadVerdict(ctx context.Context, tally *phaseTally, rate ByteRate, transferred int64) error {
+// uploadVerdict is phaseError for an upload phase, whose evidence is the
+// requests the server acknowledged rather than the bytes the phase sent.
+//
+// Upload bytes are counted when they are handed to the socket, so they prove
+// nothing reached the endpoint: a body fits in the kernel's send buffer whether
+// the server is reading it, has stopped answering, or is about to reset the
+// connection. Passing a phase on them returned nil from a server that
+// acknowledged nothing, beside a rate of RateUnavailable, which is the broken
+// endpoint reading as an idle one. Only an acknowledgement shows the server
+// received a request.
+//
+// The cost is the link too slow to finish one request inside the window: its
+// phase now fails instead of passing. That link yields no upload rate either
+// way, since the rate is built from acknowledgements, so no measurement is lost.
+//
+// When nothing measurable came back and a refusal is what the phase ended on,
+// the refusal is the verdict even if some requests were acknowledged —
+// reporting only that no rate came out sent operators to the link while the
+// server had no upload route.
+func uploadVerdict(ctx context.Context, tally *phaseTally, rate ByteRate, acknowledged int64) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -391,7 +457,17 @@ func uploadVerdict(ctx context.Context, tally *phaseTally, rate ByteRate, transf
 			return cause
 		}
 	}
-	return phaseError(ctx, tally, transferred)
+	return phaseError(ctx, tally, acknowledged)
+}
+
+// uploadEvidence reports how many requests of the phase that just ran on td
+// the server acknowledged. A direction without the stock acknowledgement meter
+// can only offer the bytes it sent, which is what the verdict used before.
+func uploadEvidence(td *TestDirection, sent int64) int64 {
+	if td.ackMeter == nil {
+		return sent
+	}
+	return int64(td.ackMeter.acknowledged())
 }
 
 func downloadRequest(ctx context.Context, s *Server, w int) error {

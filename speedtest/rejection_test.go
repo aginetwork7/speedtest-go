@@ -119,3 +119,64 @@ func TestMultiUploadReportsRejection(t *testing.T) {
 		t.Fatalf("a multi-server upload phase of refused requests returned %v, want ErrRequestRejected", err)
 	}
 }
+
+// An upload's bytes are counted when they are handed to the socket, not when
+// the server receives them, so bytes moved prove nothing about the endpoint.
+// A server that takes the connection and never answers, or drops it part-way
+// through a body, acknowledges nothing; the phase must say so rather than
+// return nil beside a rate of N/A.
+func TestUploadFailsWhenNothingIsAcknowledged(t *testing.T) {
+	for name, newHandler := range map[string]func(testOver <-chan struct{}) http.HandlerFunc{
+		// The silent handler holds its request until the test is over: the
+		// client abandoning a request does not always close the connection
+		// under it, and httptest.Server.Close waits for every handler.
+		"silent": func(testOver <-chan struct{}) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					return
+				}
+				select {
+				case <-r.Context().Done():
+				case <-testOver:
+				}
+			}
+		},
+		"reset": func(<-chan struct{}) http.HandlerFunc {
+			return func(w http.ResponseWriter, r *http.Request) {
+				if r.Method != http.MethodPost {
+					return
+				}
+				_, _ = io.CopyN(io.Discard, r.Body, 1024)
+				conn, _, err := w.(http.Hijacker).Hijack()
+				if err != nil {
+					t.Errorf("Hijack: %v", err)
+					return
+				}
+				_ = conn.Close()
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			testOver := make(chan struct{})
+			origin := httptest.NewServer(newHandler(testOver))
+			t.Cleanup(origin.Close)
+			// Cleanups run last-registered first, so the handler is released
+			// before Close waits for it.
+			t.Cleanup(func() { close(testOver) })
+			target := newTestTarget(t, origin.URL, 300*time.Millisecond, 1)
+
+			err := target.UploadTestContext(context.Background())
+			// The case under test is bytes handed to the socket with nothing
+			// acknowledged; a fixture that misses either half proves nothing.
+			if moved := target.Context.GetTotalUpload(); moved == 0 {
+				t.Fatalf("the fixture moved no bytes, so it does not reach the case under test")
+			}
+			if target.Context.GetAckedUploadRate() != 0 {
+				t.Fatalf("the fixture acknowledged an upload, so it does not reach the case under test")
+			}
+			if !errors.Is(err, ErrConnectTimeout) {
+				t.Fatalf("an upload phase with nothing acknowledged returned %v, want ErrConnectTimeout", err)
+			}
+		})
+	}
+}
