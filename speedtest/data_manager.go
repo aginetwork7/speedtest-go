@@ -231,9 +231,10 @@ func (td *TestDirection) run(ctx context.Context, cancel context.CancelFunc, mai
 		panic("empty task stack")
 	}
 	// A phase reports what it measured, so it starts from a clean meter. The
-	// download side already got this for free — rateCapture builds a fresh
-	// Welford per run — while the upload meter lived as long as the direction
-	// and would have folded an earlier phase's samples into this one's rate.
+	// download side gets this from rateCapture, which builds a fresh Welford
+	// per run and measures from the byte count at its start; the upload meter
+	// lived as long as the direction and would have folded an earlier phase's
+	// samples into this one's rate.
 	if td.ackMeter != nil {
 		td.ackMeter.reset()
 	}
@@ -320,7 +321,12 @@ func (td *TestDirection) run(ctx context.Context, cancel context.CancelFunc, mai
 
 func (td *TestDirection) rateCapture() chan bool {
 	ticker := time.NewTicker(td.manager.rateCaptureFrequency)
-	var prevTotalDataVolume int64 = 0
+	// The byte counter runs for the life of the client, so this capture
+	// measures from its value now. Starting from zero fed every byte of
+	// earlier phases into the first sample, and a second measurement on the
+	// same client read several hundred times the real rate.
+	base := td.GetTotalDataVolume()
+	prevTotalDataVolume := base
 	stopCapture := make(chan bool)
 	td.welford = internal.NewWelford(5*time.Second, td.manager.rateCaptureFrequency)
 	sTime := time.Now()
@@ -336,7 +342,7 @@ func (td *TestDirection) rateCapture() chan bool {
 					td.RateSequence = append(td.RateSequence, deltaDataVolume)
 				}
 				// anyway we update the measuring instrument
-				globalAvg := (float64(td.GetTotalDataVolume())) / float64(time.Since(sTime).Milliseconds()) * 1000
+				globalAvg := (float64(td.GetTotalDataVolume() - base)) / float64(time.Since(sTime).Milliseconds()) * 1000
 				if td.welford.Update(globalAvg, float64(deltaDataVolume)) {
 					go td.closeFunc()
 				}

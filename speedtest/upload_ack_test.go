@@ -941,3 +941,39 @@ func TestUploadLatencyIsNotInheritedFromAnEarlierPhase(t *testing.T) {
 		t.Fatalf("a phase with no measured latency applied %v from the previous phase", latency)
 	}
 }
+
+// One meter serves every server in a multi-server upload, and it can subtract
+// only one round trip. Charging every request the main server's would credit a
+// near server with time it never spent and a far one with time it did, so with
+// servers on different paths no correction is applied. A single server keeps
+// its own.
+func TestMultiUploadAppliesOneServersLatencyOnlyToItself(t *testing.T) {
+	server, _ := newCountingServer(t, nil)
+	far := newTestTarget(t, server.URL, 300*time.Millisecond, 2)
+	near, err := far.Context.CustomServer(server.URL)
+	if err != nil {
+		t.Fatalf("CustomServer: %v", err)
+	}
+	far.Latency = 200 * time.Millisecond
+	near.Latency = 5 * time.Millisecond
+	meter := far.Context.Manager.(*DataManager).upload.ackMeter
+	latency := func() time.Duration {
+		meter.mu.Lock()
+		defer meter.mu.Unlock()
+		return meter.latency
+	}
+
+	if err := far.MultiUploadTestContext(context.Background(), Servers{far, near}); err != nil {
+		t.Fatalf("MultiUploadTestContext: %v", err)
+	}
+	if got := latency(); got != 0 {
+		t.Fatalf("servers on different paths were all charged a round trip of %v", got)
+	}
+
+	if err := far.MultiUploadTestContext(context.Background(), Servers{far}); err != nil {
+		t.Fatalf("MultiUploadTestContext: %v", err)
+	}
+	if got := latency(); got != far.Latency {
+		t.Fatalf("a single server was charged %v instead of its own %v", got, far.Latency)
+	}
+}

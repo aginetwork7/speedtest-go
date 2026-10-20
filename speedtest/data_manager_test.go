@@ -131,3 +131,34 @@ func TestStartRunsCallerHandlersAgain(t *testing.T) {
 		}
 	}
 }
+
+// A direction's byte counter runs for the life of the client, while each run
+// starts a fresh rate capture. The capture has to start from the counter's
+// value at that moment: starting from zero fed every byte of earlier phases
+// into the first sample, so a second measurement on the same client read
+// several times the real rate.
+func TestDownloadRateIgnoresEarlierPhasesBytes(t *testing.T) {
+	measure := func(earlier int64) float64 {
+		dm := NewDataManager()
+		dm.SetCaptureTime(time.Second)
+		dm.SetNThread(1)
+		dm.AddTotalDownload(earlier)
+		steady := func() {
+			dm.AddTotalDownload(10_000)
+			time.Sleep(10 * time.Millisecond)
+		}
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		dm.download.run(ctx, cancel, 0, []func(){steady})
+		return dm.GetEWMADownloadRate()
+	}
+
+	fresh := measure(0)
+	after := measure(500 << 20)
+	if fresh <= 0 {
+		t.Fatalf("the steady handler measured no rate, so the comparison means nothing")
+	}
+	if after > fresh*1.5 {
+		t.Fatalf("after 500 MiB of earlier phases the rate read %.0f B/s, against %.0f B/s on a fresh client", after, fresh)
+	}
+}

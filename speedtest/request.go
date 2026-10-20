@@ -110,6 +110,11 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 //
 // It returns what UploadTestContext does, and also fails before measuring when
 // servers has none available.
+//
+// The servers share one acknowledgement meter, which can correct for only one
+// round trip. With more than one server it applies none, so the rate reads low
+// when their paths are long, and request sizes follow whichever server
+// answered last.
 func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
 	if ss.Len() == 0 {
@@ -135,7 +140,17 @@ func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) er
 	// Every server in the list carries the client as its Context, so one
 	// manager accounts for all of them.
 	manager := (*ss)[0].Context.Manager
-	manager.SetUploadLatency(s.Latency)
+	// The meter subtracts one round trip from every acknowledged request, and
+	// servers on different paths have different ones. Charging every request
+	// the main server's would credit a near server with time it never spent
+	// and a far one with time it did, so a list of several gets no correction,
+	// which reads low rather than wrong in either direction. Payload sizing is
+	// shared the same way, following whichever server answered last.
+	var latency time.Duration
+	if ss.Len() == 1 {
+		latency = (*ss)[0].Latency
+	}
+	manager.SetUploadLatency(latency)
 	before := manager.GetTotalUpload()
 	td, err := runPhase(manager, uploadPhase, _context, cancel, mainIDIndex, fns) // block here
 	if err != nil {
