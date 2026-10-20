@@ -171,8 +171,10 @@ func TestUploadFailsWhenNothingIsAcknowledged(t *testing.T) {
 			if moved := target.Context.GetTotalUpload(); moved == 0 {
 				t.Fatalf("the fixture moved no bytes, so it does not reach the case under test")
 			}
-			if target.Context.GetAckedUploadRate() != 0 {
-				t.Fatalf("the fixture acknowledged an upload, so it does not reach the case under test")
+			// The count, not the rate: an acknowledged request too short to
+			// qualify for the rate would leave it at zero.
+			if acked := target.Context.Manager.(*DataManager).upload.ackMeter.acknowledged(); acked != 0 {
+				t.Fatalf("the fixture acknowledged %d uploads, so it does not reach the case under test", acked)
 			}
 			if !errors.Is(err, ErrConnectTimeout) {
 				t.Fatalf("an upload phase with nothing acknowledged returned %v, want ErrConnectTimeout", err)
