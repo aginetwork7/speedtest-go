@@ -139,19 +139,25 @@ func newUploadAckMeter() *uploadAckMeter {
 	return &uploadAckMeter{payload: minUploadPayload}
 }
 
-// setLatency supplies the round trip measured by the latency phase. Left at
-// zero — no latency phase ran — no correction is applied, which reads low
-// rather than inventing a number.
+// setLatency supplies the round trip of the server the next phase runs
+// against. Zero — no latency phase ran — applies no correction, which reads
+// low rather than inventing a number.
+//
+// Every phase sets it, zero included. The meter is shared by every server on
+// the client, so ignoring a zero kept the round trip an earlier phase left
+// behind, measured on another path, and the same phase read differently
+// depending on what ran before it.
 func (m *uploadAckMeter) setLatency(d time.Duration) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	if d > 0 {
-		m.latency = d
+	if d < 0 {
+		d = 0
 	}
+	m.latency = d
 }
 
-// reset clears what a phase measured. The latency is left in place: it belongs
-// to the path, and it is supplied before the phase starts.
+// reset clears what a phase measured. The latency is left in place because it
+// is supplied before the phase starts, and Start resets the meter after that.
 func (m *uploadAckMeter) reset() {
 	m.mu.Lock()
 	defer m.mu.Unlock()

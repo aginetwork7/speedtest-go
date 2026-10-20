@@ -69,13 +69,9 @@ func checkStatus(resp *http.Response, what string) error {
 // MultiDownloadTestContext measures download speed across servers, which must
 // share s's client, and leaves the rate in s.DLSpeed.
 //
-// The returned error says whether the endpoint answered; the rate left in
-// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
-// the endpoint answered: a download received bytes, or an upload had a request
-// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
-// (wrapped) when the server refused the requests, or ErrConnectTimeout. It
-// also fails before measuring when servers has none available, or with
-// ErrorUninitializedManager when none of them registered a handler.
+// It returns what DownloadTestContext does. It also fails before measuring
+// when servers has none available, or with ErrorUninitializedManager when none
+// of them registered a handler.
 func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
 	if ss.Len() == 0 {
@@ -114,13 +110,9 @@ func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) 
 // MultiUploadTestContext measures upload speed across servers, which must
 // share s's client, and leaves the rate in s.ULSpeed.
 //
-// The returned error says whether the endpoint answered; the rate left in
-// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
-// the endpoint answered: a download received bytes, or an upload had a request
-// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
-// (wrapped) when the server refused the requests, or ErrConnectTimeout. It
-// also fails before measuring when servers has none available, or with
-// ErrorUninitializedManager when none of them registered a handler.
+// It returns what UploadTestContext does. It also fails before measuring when
+// servers has none available, or with ErrorUninitializedManager when none of
+// them registered a handler.
 func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
 	if ss.Len() == 0 {
@@ -167,10 +159,14 @@ func (s *Server) DownloadTest() error {
 // DownloadTestContext executes the test to measure download speed, observing the given context.
 //
 // The returned error says whether the endpoint answered; the rate left in
-// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
-// the endpoint answered: a download received bytes, or an upload had a request
-// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
-// (wrapped) when the server refused the requests, or ErrConnectTimeout.
+// s.DLSpeed says whether anything measurable came back. The first of these
+// that applies decides it:
+//
+//  1. The caller's ctx ended: ctx.Err(), even if bytes had arrived.
+//  2. Some bytes arrived: nil.
+//  3. No request succeeded: ErrRequestRejected (wrapped) if the last failure
+//     was a refusal, otherwise ErrConnectTimeout.
+//  4. Otherwise nil.
 func (s *Server) DownloadTestContext(ctx context.Context) error {
 	return s.downloadTestContext(ctx, downloadRequest)
 }
@@ -207,10 +203,20 @@ func (s *Server) UploadTest() error {
 // UploadTestContext executes the test to measure upload speed, observing the given context.
 //
 // The returned error says whether the endpoint answered; the rate left in
-// DLSpeed/ULSpeed says whether anything measurable came back. It is nil once
-// the endpoint answered: a download received bytes, or an upload had a request
-// acknowledged. Otherwise it is the caller's ctx.Err(), ErrRequestRejected
-// (wrapped) when the server refused the requests, or ErrConnectTimeout.
+// s.ULSpeed says whether anything measurable came back. The first of these
+// that applies decides it:
+//
+//  1. The caller's ctx ended: ctx.Err(), even if requests were acknowledged.
+//  2. No rate came out and the last failure was a refusal: ErrRequestRejected
+//     (wrapped), even if some requests were acknowledged.
+//  3. Some request was acknowledged: nil.
+//  4. No request succeeded: ErrRequestRejected (wrapped) if the last failure
+//     was a refusal, otherwise ErrConnectTimeout.
+//  5. Otherwise nil.
+//
+// Step 2 is the one way this differs from DownloadTestContext. Bytes sent prove
+// nothing, so an upload's evidence is acknowledgements, and a phase that ends
+// on refusals with no rate is reported as refused.
 func (s *Server) UploadTestContext(ctx context.Context) error {
 	return s.uploadTestContext(ctx, uploadRequest)
 }

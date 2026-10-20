@@ -922,3 +922,22 @@ func TestAckMeterSlowStartRequestDoesNotOpenTheWindow(t *testing.T) {
 		t.Fatalf("rate %.0f B/s, want %.0f — a slow-start request opened the window", got, want)
 	}
 }
+
+// Every server on a client shares one upload meter, and each upload phase
+// supplies its own server's round trip before it starts. A phase against a
+// server whose latency was never measured must apply no correction, not the
+// round trip an earlier phase left behind on another path.
+func TestUploadLatencyIsNotInheritedFromAnEarlierPhase(t *testing.T) {
+	dm := NewDataManager()
+	dm.SetUploadLatency(200 * time.Millisecond)
+	dm.upload.ackMeter.reset()
+
+	dm.SetUploadLatency(0)
+
+	dm.upload.ackMeter.mu.Lock()
+	latency := dm.upload.ackMeter.latency
+	dm.upload.ackMeter.mu.Unlock()
+	if latency != 0 {
+		t.Fatalf("a phase with no measured latency applied %v from the previous phase", latency)
+	}
+}

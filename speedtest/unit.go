@@ -55,8 +55,13 @@ type ByteRate float64
 //   - nil: the endpoint answered — some bytes arrived, or some upload was
 //     acknowledged — but too little to measure.
 //   - ErrRequestRejected: the server refused the requests, for example an
-//     endpoint that reads each upload body and then answers 401.
+//     endpoint that reads each upload body and then answers 401. An upload
+//     phase reports this even if some of its requests were acknowledged.
 //   - ErrConnectTimeout: nothing arrived and nothing was acknowledged.
+//   - the caller's ctx.Err(): the run was cancelled.
+//
+// DownloadTestContext and UploadTestContext give the order in which these are
+// decided.
 const RateUnavailable ByteRate = -1
 
 var globalByteRateUnit UnitType

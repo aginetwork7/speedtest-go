@@ -322,6 +322,13 @@ func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, m
 // Start itself leaves handlers alone. Ones a caller registered through the
 // exported API belong to that caller, who may start the direction again; a
 // Start that dropped them made the second call panic on an empty task stack.
+//
+// A caller must not also run the package's phases on the same client. Those
+// register into the same list, so a phase runs the caller's handlers beside
+// its own, is crowded out entirely when the list is already full, and then
+// drops everything, the caller's handlers included. The first two predate the
+// call to dropHandlers; giving each phase a handler set of its own would end
+// all three.
 func (td *TestDirection) dropHandlers() {
 	td.fns = nil
 }
