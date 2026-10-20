@@ -69,86 +69,83 @@ func checkStatus(resp *http.Response, what string) error {
 // MultiDownloadTestContext measures download speed across servers, which must
 // share s's client, and leaves the rate in s.DLSpeed.
 //
-// It returns what DownloadTestContext does. It also fails before measuring
-// when servers has none available, or with ErrorUninitializedManager when none
-// of them registered a handler.
+// It returns what DownloadTestContext does, and also fails before measuring when
+// servers has none available.
 func (s *Server) MultiDownloadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
 	if ss.Len() == 0 {
 		return errors.New("not found available servers")
 	}
 	mainIDIndex := 0
-	var td *TestDirection
 	_context, cancel := context.WithCancel(ctx)
 	defer cancel()
 	tally := &phaseTally{}
+	fns := make([]func(), 0, ss.Len())
 	for i, server := range *ss {
 		if server.ID == s.ID {
 			mainIDIndex = i
 		}
 		sp := server
-		dbg.Printf("Register Download Handler: %s\n", sp.URL)
-		td = server.Context.RegisterDownloadHandler(func() {
+		dbg.Printf("Download Handler: %s\n", sp.URL)
+		fns = append(fns, func() {
 			tally.note(downloadRequest(_context, sp, 3))
 		})
 	}
-	if td == nil {
-		return ErrorUninitializedManager
-	}
 	// Every server in the list carries the client as its Context, so one
 	// manager accounts for all of them.
-	before := td.manager.GetTotalDownload()
-	td.Start(_context, cancel, mainIDIndex) // block here
-	td.dropHandlers()
-	s.DLSpeed = ByteRate(td.manager.GetEWMADownloadRate())
+	manager := (*ss)[0].Context.Manager
+	before := manager.GetTotalDownload()
+	if _, err := runPhase(manager, downloadPhase, _context, cancel, mainIDIndex, fns); err != nil { // block here
+		return err
+	}
+	s.DLSpeed = ByteRate(manager.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && tally.mostlyFailed() {
 		s.DLSpeed = RateUnavailable
 	}
-	return phaseError(ctx, tally, td.manager.GetTotalDownload()-before)
+	return phaseError(ctx, tally, manager.GetTotalDownload()-before)
 }
 
 // MultiUploadTestContext measures upload speed across servers, which must
 // share s's client, and leaves the rate in s.ULSpeed.
 //
-// It returns what UploadTestContext does. It also fails before measuring when
-// servers has none available, or with ErrorUninitializedManager when none of
-// them registered a handler.
+// It returns what UploadTestContext does, and also fails before measuring when
+// servers has none available.
 func (s *Server) MultiUploadTestContext(ctx context.Context, servers Servers) error {
 	ss := servers.Available()
 	if ss.Len() == 0 {
 		return errors.New("not found available servers")
 	}
 	mainIDIndex := 0
-	var td *TestDirection
 	_context, cancel := context.WithCancel(ctx)
 	defer cancel()
 	requestCtx, stopRequests := uploadRequestContext(ctx, _context, uploadPhaseGrace(s))
 	defer stopRequests()
 	tally := &phaseTally{}
+	fns := make([]func(), 0, ss.Len())
 	for i, server := range *ss {
 		if server.ID == s.ID {
 			mainIDIndex = i
 		}
 		sp := server
-		dbg.Printf("Register Upload Handler: %s\n", sp.URL)
-		td = server.Context.RegisterUploadHandler(func() {
+		dbg.Printf("Upload Handler: %s\n", sp.URL)
+		fns = append(fns, func() {
 			tally.note(uploadRequest(requestCtx, sp))
 		})
 	}
-	if td == nil {
-		return ErrorUninitializedManager
-	}
-	td.manager.SetUploadLatency(s.Latency)
 	// Every server in the list carries the client as its Context, so one
 	// manager accounts for all of them.
-	before := td.manager.GetTotalUpload()
-	td.Start(_context, cancel, mainIDIndex) // block here
-	td.dropHandlers()
-	s.ULSpeed = ByteRate(td.manager.GetAckedUploadRate())
+	manager := (*ss)[0].Context.Manager
+	manager.SetUploadLatency(s.Latency)
+	before := manager.GetTotalUpload()
+	td, err := runPhase(manager, uploadPhase, _context, cancel, mainIDIndex, fns) // block here
+	if err != nil {
+		return err
+	}
+	s.ULSpeed = ByteRate(manager.GetAckedUploadRate())
 	if s.ULSpeed == 0 && tally.mostlyFailed() {
 		s.ULSpeed = RateUnavailable
 	}
-	return uploadVerdict(ctx, tally, s.ULSpeed, uploadEvidence(td, td.manager.GetTotalUpload()-before))
+	return uploadVerdict(ctx, tally, s.ULSpeed, uploadEvidence(td, manager.GetTotalUpload()-before))
 }
 
 // DownloadTest executes the test to measure download speed
@@ -167,6 +164,9 @@ func (s *Server) DownloadTest() error {
 //  3. No request succeeded: ErrRequestRejected (wrapped) if the last failure
 //     was a refusal, otherwise ErrConnectTimeout.
 //  4. Otherwise nil.
+//
+// Before any of these it returns ErrorUninitializedManager if the client's
+// Manager is not the stock one and offers no direction to run on.
 func (s *Server) DownloadTestContext(ctx context.Context) error {
 	return s.downloadTestContext(ctx, downloadRequest)
 }
@@ -180,11 +180,12 @@ func (s *Server) downloadTestContext(ctx context.Context, downloadRequest downlo
 	// reading them raw would inherit an earlier phase's bytes and call itself
 	// successful on them.
 	before := s.Context.GetTotalDownload()
-	td := s.Context.RegisterDownloadHandler(func() {
+	if _, err := runPhase(s.Context.Manager, downloadPhase, _context, cancel, 0, []func(){func() {
 		tally.note(downloadRequest(_context, s, 3))
-	})
-	td.Start(_context, cancel, 0)
-	td.dropHandlers()
+	}}); err != nil {
+		cancel()
+		return err
+	}
 	duration := time.Since(start)
 	s.DLSpeed = ByteRate(s.Context.GetEWMADownloadRate())
 	if s.DLSpeed == 0 && tally.mostlyFailed() {
@@ -216,7 +217,8 @@ func (s *Server) UploadTest() error {
 //
 // Step 2 is the one way this differs from DownloadTestContext. Bytes sent prove
 // nothing, so an upload's evidence is acknowledgements, and a phase that ends
-// on refusals with no rate is reported as refused.
+// on refusals with no rate is reported as refused. ErrorUninitializedManager
+// comes first, as in DownloadTestContext.
 func (s *Server) UploadTestContext(ctx context.Context) error {
 	return s.uploadTestContext(ctx, uploadRequest)
 }
@@ -231,11 +233,13 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	// See downloadTestContext: the verdict is about this phase, not about
 	// everything the manager has ever sent.
 	before := s.Context.GetTotalUpload()
-	td := s.Context.RegisterUploadHandler(func() {
+	td, err := runPhase(s.Context.Manager, uploadPhase, _context, cancel, 0, []func(){func() {
 		tally.note(uploadRequest(requestCtx, s))
-	})
-	td.Start(_context, cancel, 0)
-	td.dropHandlers()
+	}})
+	if err != nil {
+		cancel()
+		return err
+	}
 	duration := time.Since(start)
 	s.ULSpeed = ByteRate(s.Context.GetAckedUploadRate())
 	if s.ULSpeed == 0 && tally.mostlyFailed() {
@@ -244,6 +248,61 @@ func (s *Server) uploadTestContext(ctx context.Context, uploadRequest uploadFunc
 	s.TestDuration.Upload = &duration
 	s.testDurationTotalCount()
 	return uploadVerdict(ctx, tally, s.ULSpeed, uploadEvidence(td, s.Context.GetTotalUpload()-before))
+}
+
+// phaseDirection names the direction of a manager that a built-in phase runs
+// on, in the two forms runPhase can reach it by.
+type phaseDirection struct {
+	own      func(*DataManager) *TestDirection
+	register func(Manager, func()) *TestDirection
+}
+
+var (
+	downloadPhase = phaseDirection{
+		own:      func(dm *DataManager) *TestDirection { return dm.download },
+		register: Manager.RegisterDownloadHandler,
+	}
+	uploadPhase = phaseDirection{
+		own:      func(dm *DataManager) *TestDirection { return dm.upload },
+		register: Manager.RegisterUploadHandler,
+	}
+)
+
+// runPhase runs a built-in phase's handlers on m's direction and returns that
+// direction once every worker has stopped.
+//
+// With the stock DataManager the handlers go straight to the direction and
+// never enter the list RegisterDownloadHandler/RegisterUploadHandler fill. That
+// list belongs to callers of the exported API. A phase that shared it ran a
+// caller's handlers beside its own, mixing their traffic into its reading; was
+// crowded out when the list was already full, then reported a verdict and a
+// rate for requests it never made; and cleared the caller's handlers on its way
+// out, so their next Start panicked. At most nThread handlers run, as
+// registration allowed.
+//
+// Any other Manager offers its directions only through registration, so the
+// handlers go through the shared list as they always have, and are removed
+// afterwards: they close over this run's context, which is cancelled once it
+// ends. Mixing caller handlers with the package's phases stays unsound there.
+func runPhase(m Manager, dir phaseDirection, ctx context.Context, cancel context.CancelFunc, mainIndex int, fns []func()) (*TestDirection, error) {
+	if dm, ok := m.(*DataManager); ok {
+		if len(fns) > dm.nThread {
+			fns = fns[:dm.nThread]
+		}
+		td := dir.own(dm)
+		td.run(ctx, cancel, mainIndex, fns)
+		return td, nil
+	}
+	var td *TestDirection
+	for _, fn := range fns {
+		td = dir.register(m, fn)
+	}
+	if td == nil {
+		return nil, ErrorUninitializedManager
+	}
+	td.Start(ctx, cancel, mainIndex)
+	td.fns = nil
+	return td, nil
 }
 
 // phaseTally records what one throughput phase attempted, and keeps the last

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -378,5 +379,92 @@ func TestSlowLinkIsNotReportedAsUnreachable(t *testing.T) {
 	}
 	if target.Context.GetTotalDownload() == 0 {
 		t.Fatal("the test did not actually transfer anything")
+	}
+}
+
+// A built-in phase runs its own handlers and nothing else. The direction's
+// handler list belongs to callers of the exported API; a phase that shared it
+// (a) ran a caller's handler beside its own, mixing the caller's traffic into
+// its reading; (b) was crowded out when the list was already full, then
+// reported a verdict and a rate for requests it never made; and (c) cleared
+// the list on its way out, so the caller's next Start panicked.
+func TestPhaseRunsOnlyItsOwnHandlers(t *testing.T) {
+	type phase struct {
+		register func(*Server, func()) *TestDirection
+		run      func(*Server) error
+	}
+	download := func(s *Server, fn func()) *TestDirection { return s.Context.RegisterDownloadHandler(fn) }
+	upload := func(s *Server, fn func()) *TestDirection { return s.Context.RegisterUploadHandler(fn) }
+	for name, p := range map[string]phase{
+		"download": {download, func(s *Server) error { return s.DownloadTestContext(context.Background()) }},
+		"upload":   {upload, func(s *Server) error { return s.UploadTestContext(context.Background()) }},
+		"multi download": {download, func(s *Server) error {
+			return s.MultiDownloadTestContext(context.Background(), Servers{s})
+		}},
+		"multi upload": {upload, func(s *Server) error {
+			return s.MultiUploadTestContext(context.Background(), Servers{s})
+		}},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var served atomic.Int64
+			server, _ := newCountingServer(t, func() { served.Add(1) })
+			// One thread, so the caller's handler fills the list on its own.
+			target := newTestTarget(t, server.URL, 300*time.Millisecond, 1)
+
+			var callerRuns atomic.Int64
+			td := p.register(target, func() {
+				callerRuns.Add(1)
+				time.Sleep(5 * time.Millisecond)
+			})
+			servedBefore := served.Load()
+
+			err := p.run(target)
+			if n := callerRuns.Load(); n != 0 {
+				t.Errorf("(a) the phase ran the caller's handler %d times", n)
+			}
+			if served.Load() == servedBefore {
+				t.Errorf("(b) the phase sent no request of its own, yet returned %v", err)
+			}
+			if err != nil {
+				t.Errorf("the phase against a working server returned %v", err)
+			}
+
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						t.Fatalf("(c) the caller's Start after the phase panicked: %v", r)
+					}
+				}()
+				ctx, cancel := context.WithCancel(context.Background())
+				defer cancel()
+				td.Start(ctx, cancel, 0)
+			}()
+			if callerRuns.Load() == 0 {
+				t.Errorf("(c) the caller's handler did not run after the phase")
+			}
+		})
+	}
+}
+
+// wrappedManager is a Manager that is not the stock *DataManager, so a phase
+// can only reach its directions through registration.
+type wrappedManager struct{ *DataManager }
+
+// A Manager other than the stock one still measures, through the shared list,
+// and a phase leaves no handler behind for the next one to inherit.
+func TestPhaseRunsThroughRegistrationOnOtherManagers(t *testing.T) {
+	var served atomic.Int64
+	server, _ := newCountingServer(t, func() { served.Add(1) })
+	target := newTestTarget(t, server.URL, 300*time.Millisecond, 1)
+	target.Context.Manager = wrappedManager{target.Context.Manager.(*DataManager)}
+
+	for run := 1; run <= 2; run++ {
+		before := served.Load()
+		if err := target.DownloadTestContext(context.Background()); err != nil {
+			t.Fatalf("run %d: %v", run, err)
+		}
+		if served.Load() == before {
+			t.Fatalf("run %d sent no request; a handler from an earlier run took its place", run)
+		}
 	}
 }

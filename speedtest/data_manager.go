@@ -212,14 +212,22 @@ func (td *TestDirection) AddTotalDataVolume(delta int64) int64 {
 	return atomic.AddInt64(&td.totalDataVolume, delta)
 }
 
-// Start runs the registered handlers until the capture window closes or ctx
-// ends, then blocks until every worker has stopped.
+// Start runs the handlers registered on td until the capture window closes or
+// ctx ends, then blocks until every worker has stopped. It leaves them
+// registered, so a caller may start the direction again.
 //
 // ctx must be the same context the handlers issue their requests with: when it
 // ends, the handlers fail immediately, so a worker that kept looping on the
 // running flag alone would spin at full CPU until the capture timer fired.
 func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, mainRequestHandlerIndex int) {
-	if len(td.fns) == 0 {
+	td.run(ctx, cancel, mainRequestHandlerIndex, td.fns)
+}
+
+// run is Start with the handlers passed in rather than read from td. The
+// package's own phases use it so that their handlers never enter td's list,
+// which belongs to callers of the exported API; see runPhase.
+func (td *TestDirection) run(ctx context.Context, cancel context.CancelFunc, mainRequestHandlerIndex int, fns []func()) {
+	if len(fns) == 0 {
 		panic("empty task stack")
 	}
 	// A phase reports what it measured, so it starts from a clean meter. The
@@ -229,21 +237,21 @@ func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, m
 	if td.ackMeter != nil {
 		td.ackMeter.reset()
 	}
-	if mainRequestHandlerIndex > len(td.fns)-1 {
+	if mainRequestHandlerIndex > len(fns)-1 {
 		mainRequestHandlerIndex = 0
 	}
 	mainLoadFactor := 0.1
 	// When the number of processor cores is equivalent to the processing program,
 	// the processing efficiency reaches the highest level (VT is not considered).
-	mainN := int(mainLoadFactor * float64(len(td.fns)))
+	mainN := int(mainLoadFactor * float64(len(fns)))
 	if mainN == 0 {
 		mainN = 1
 	}
-	if len(td.fns) == 1 {
+	if len(fns) == 1 {
 		mainN = td.manager.nThread
 	}
 	auxN := td.manager.nThread - mainN
-	dbg.Printf("Available fns: %d\n", len(td.fns))
+	dbg.Printf("Available fns: %d\n", len(fns))
 	dbg.Printf("mainN: %d\n", mainN)
 	dbg.Printf("auxN: %d\n", auxN)
 	wg := sync.WaitGroup{}
@@ -279,7 +287,7 @@ func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, m
 			if !running {
 				return
 			}
-			td.fns[fnIndex]()
+			fns[fnIndex]()
 		}
 	}
 
@@ -289,7 +297,7 @@ func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, m
 		go worker(mainRequestHandlerIndex)
 	}
 	for j := 0; j < auxN; {
-		for i := range td.fns {
+		for i := range fns {
 			if j == auxN {
 				break
 			}
@@ -308,29 +316,6 @@ func (td *TestDirection) Start(ctx context.Context, cancel context.CancelFunc, m
 	// goroutine — leaving it writing the Welford state while the caller reads
 	// the final rate out of it.
 	td.closeFunc()
-}
-
-// dropHandlers removes every handler registered on td.
-//
-// The package's own phases call it once Start returns, because their handlers
-// close over the context of the run that registered them, which Start has just
-// cancelled. RegisterUpload/DownloadHandler only accepts new handlers while
-// fewer than nThread are installed, so the next phase on this direction would
-// otherwise inherit workers that can only fail, and with a single thread would
-// get nothing else.
-//
-// Start itself leaves handlers alone. Ones a caller registered through the
-// exported API belong to that caller, who may start the direction again; a
-// Start that dropped them made the second call panic on an empty task stack.
-//
-// A caller must not also run the package's phases on the same client. Those
-// register into the same list, so a phase runs the caller's handlers beside
-// its own, is crowded out entirely when the list is already full, and then
-// drops everything, the caller's handlers included. The first two predate the
-// call to dropHandlers; giving each phase a handler set of its own would end
-// all three.
-func (td *TestDirection) dropHandlers() {
-	td.fns = nil
 }
 
 func (td *TestDirection) rateCapture() chan bool {
